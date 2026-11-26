@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -375,6 +376,11 @@ def _download_file(media: Media, target: Path, opener: Opener, abort: AbortCheck
                 written += len(chunk)
                 if written % CHECK_EVERY < len(chunk) and (reason := abort()):
                     raise Aborted(reason)
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise UnsupportedMedia(f"the file host refused the VPS (HTTP {error.code}); it needs the owner's browser "
+                                   "session") from None
+        raise DownloadError(redact(f"HTTPError: {error}")) from None
     except OSError as error:
         raise DownloadError(redact(f"{type(error).__name__}: {error}")) from None
     if reason := abort():

@@ -223,6 +223,19 @@ class MediaTest(unittest.TestCase):
         with self.assertRaises(UnsupportedMedia):
             media.download(Media(kind="hls", url="http://media.example.test/v.m3u8"), self.asset, self.dir / "v1", 720)
 
+    def test_an_attachment_the_host_refuses_is_unsupported_not_retried(self):
+        import urllib.error
+
+        def refuse(request, timeout=0):
+            raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
+        attachment = Asset(asset_id="f1", kind="file", title="workbook.pdf", ref="f1")
+        with self.assertRaises(UnsupportedMedia) as raised:
+            media.download(Media(kind="file", url=SIGNED), attachment, self.dir / "f1", 720, opener=refuse,
+                           proxy_url=PROXY)
+        self.assertIn("HTTP 403", str(raised.exception))
+        self.assertNotIn("SECRET", str(raised.exception))
+        self.assertEqual(list(self.dir.iterdir()), [], "nothing was written")
+
     def test_a_finished_file_from_an_earlier_run_is_reused(self):
         (self.dir / "v1.mp4").write_bytes(b"done")
         run = Recorder()
