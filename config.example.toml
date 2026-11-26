@@ -1,0 +1,9 @@
+# Copy to ~/.config/course-exporter/config.toml (or point COURSE_EXPORTER_CONFIG at it) and fill in.
+# This file names real machines and paths, so the real copy stays out of git.
+browser_node = "my-mac-browser"        # OpenClaw node whose Chrome is logged in to the course sites
+browser_profile = "chrome"
+openclaw = "/home/me/.npm-global/bin/openclaw"
+drive_remote = "gdrive:Courses"        # rclone remote; each course lands in <drive_remote>/<name>
+staging_root = "/srv/staging/courses"  # every --out must be inside it
+min_free_gib = 20                      # keep this much free on the staging disk (other jobs share it)
+max_staging_gib = 5
