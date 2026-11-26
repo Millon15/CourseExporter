@@ -180,7 +180,8 @@ class MediaTest(unittest.TestCase):
         polls = iter([None, None, "stop requested"])
 
         def abort():
-            return next(polls, "stop requested") if pidfile.exists() else None
+            written = pidfile.exists() and pidfile.read_text().strip()
+            return next(polls, "stop requested") if written else None
 
         with self.assertRaises(media.Aborted):
             media._run_watched(["bash", "-c", script], abort, subprocess.Popen)
