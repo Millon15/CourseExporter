@@ -72,12 +72,14 @@ class CourseState:
         self._db.close()
 
     def record_discovery(self, refs: list[LessonRef]) -> None:
-        """Stores the course order; a lesson already seen keeps its status."""
+        """Stores the course order; a lesson already seen keeps its status, except a gated one, which the next
+        extract checks again because the owner may have unlocked it since."""
         with self._db:
             for position, ref in enumerate(refs):
                 self._db.execute(
                     "INSERT INTO lessons (lesson_id, position, ref, status, updated_at) VALUES (?, ?, ?, 'discovered', ?)"
-                    " ON CONFLICT(lesson_id) DO UPDATE SET position = excluded.position, ref = excluded.ref",
+                    " ON CONFLICT(lesson_id) DO UPDATE SET position = excluded.position, ref = excluded.ref,"
+                    " status = CASE WHEN lessons.status = 'gated' THEN 'discovered' ELSE lessons.status END",
                     (ref.lesson_id, position, _ref_to_json(ref), _now()),
                 )
 

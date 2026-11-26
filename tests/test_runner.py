@@ -154,6 +154,14 @@ class ExporterTest(unittest.TestCase):
         self.assertNotIn("SECRET", " ".join(self.logs))
 
 
+    def test_rediscovery_reopens_a_gated_lesson_the_owner_unlocked(self):
+        provider = self.course(Lesson(ref(1), "gated", "", ()), Lesson(ref(2), "available", "", (video("v2"),)))
+        self.exporter(provider).run(self.options())
+        provider.lessons["L1"] = Lesson(ref(1), "available", "", (video("v1"),))
+        summary = self.exporter(provider).run(self.options(rediscover=True))
+        self.assertEqual(summary.lessons, {"done": 2})
+        self.assertEqual(self.fetched, ["v2", "v1"])
+
     def test_finished_lessons_go_to_drive_and_a_failed_upload_is_retried_next_run(self):
         provider = self.course(Lesson(ref(1), "available", "", (video("v1"),)),
                                Lesson(ref(2), "available", "", (video("v2"),)))
