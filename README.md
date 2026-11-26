@@ -22,6 +22,16 @@ python3 -m course_exporter status --out <staging_root>/<folder>
 ```
 
 Exit codes: 0 complete, 1 incomplete (rerun resumes), 2 usage, 3 another export holds the folder, 5 complete with
-unsupported assets.
+gaps (gated lessons or unsupported assets). A run stops with exit 1 when staging has no room for an hour, when the disk
+floor or staging cap is reached mid-download, or when three lessons in a row fail.
+
+For a full course, `scripts/export-loop.sh` reruns the export with `--rediscover` until it ends with anything but exit
+1, waiting `RETRY_SECONDS` (600) between attempts and giving up after `MAX_IDLE` (6) attempts in a row that publish no
+new lesson. Under systemd it survives the login session:
+
+```sh
+systemd-run --user --unit course-<folder> scripts/export-loop.sh <staging_root>/<folder>.log \
+  --provider kwiga --course <course URL> --name <folder> --out <staging_root>/<folder> --decode
+```
 
 Test: `python3 -m unittest discover -s tests -t .`

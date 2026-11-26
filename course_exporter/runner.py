@@ -18,6 +18,9 @@ UNKNOWN_VIDEO_BYTES = 1024 * MIB
 FILE_BYTES = 64 * MIB
 LESSON_OVERHEAD_BYTES = 64 * MIB
 MERGE_FACTOR = 2
+FAILURE_STREAK = 3
+"""Lessons in a row that end failed or partial before the run stops: the browser node is gone (the Mac sleeps), and
+going on would only mark the rest of the course failed."""
 """yt-dlp holds the fragments and the merged or fixed-up MP4 at the same time."""
 
 
@@ -70,6 +73,7 @@ class Exporter:
         self._space = space
         self._videos_verified = 0
         self._stopped: str | None = None
+        self._streak = 0
         self._index_uploaded = publisher is None
         self._finished = {"published", "gated"} if publisher else {"done", "published", "gated"}
 
@@ -83,10 +87,16 @@ class Exporter:
             progress = f"[{position}/{len(lessons)}]"
             if status != "done":
                 status = self._export_lesson(ref, options, progress)
+                self._count_streak(status, ref)
             if status == "done" and self._publisher is not None:
                 self._publish_lesson(ref, options, progress)
         self._write_index(options)
         return self._summary()
+
+    def _count_streak(self, status: LessonStatus, ref: LessonRef) -> None:
+        self._streak = self._streak + 1 if status in ("failed", "partial") else 0
+        if self._streak >= FAILURE_STREAK and not self._stopped:
+            self._stopped = f"{self._streak} lessons in a row failed, last {ref.title!r}; check the browser node"
 
     def _lessons(self, options: ExportOptions) -> list[tuple[LessonRef, LessonStatus]]:
         if options.rediscover or not self._state.lessons():

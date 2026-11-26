@@ -164,6 +164,18 @@ class ExporterTest(unittest.TestCase):
         self.assertFalse(summary.complete)
         self.assertEqual(self.fetched, [])
 
+    def test_three_failed_lessons_in_a_row_stop_the_run(self):
+        lessons = [Lesson(ref(n), "available", "", ()) for n in range(1, 6)]
+        summary = self.exporter(self.course(*lessons, broken={"L1", "L2", "L3"})).run(self.options())
+        self.assertIn("3 lessons in a row failed", summary.stopped)
+        self.assertEqual(summary.lessons, {"failed": 3, "discovered": 2})
+
+    def test_a_good_lesson_between_failures_keeps_the_run_going(self):
+        lessons = [Lesson(ref(n), "available", "", ()) for n in range(1, 6)]
+        summary = self.exporter(self.course(*lessons, broken={"L1", "L2", "L4", "L5"})).run(self.options())
+        self.assertIsNone(summary.stopped)
+        self.assertEqual(summary.lessons, {"failed": 4, "done": 1})
+
     def test_rediscovery_reopens_a_gated_lesson_the_owner_unlocked(self):
         provider = self.course(Lesson(ref(1), "gated", "", ()), Lesson(ref(2), "available", "", (video("v2"),)))
         self.exporter(provider).run(self.options())
