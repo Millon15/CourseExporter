@@ -89,7 +89,7 @@ def _export(args: argparse.Namespace) -> int:
             browser.close()
             state.close()
     print(json.dumps({"lessons": summary.lessons, "assets": summary.assets, "complete": summary.complete,
-                      "unsupported": summary.gaps, "stopped": summary.stopped}))
+                      "gaps": summary.gaps, "stopped": summary.stopped}))
     if not summary.complete:
         return EXIT_INCOMPLETE
     return EXIT_GAPS if summary.gaps else 0

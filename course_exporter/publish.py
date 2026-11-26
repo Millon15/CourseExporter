@@ -27,6 +27,10 @@ class PublishError(Exception):
     """rclone failed; the message is redacted. Files Drive already holds may be gone from staging; the rest stay."""
 
 
+class AdmissionTimeout(Exception):
+    """No room opened for a lesson within the wait; the run stops and a rerun resumes at that lesson."""
+
+
 class BudgetError(Exception):
     """A lesson needs more staging than the whole budget allows."""
 
@@ -89,6 +93,9 @@ class SpaceBudget:
     min_free: int = 20 * GIB
     max_staging: int = 5 * GIB
     poll_seconds: int = 60
+    max_wait_seconds: int = 3600
+    """A lesson waiting this long for room ends the run, so a supervisor can rerun it; a partial lesson elsewhere may
+    hold the room, and only its own retry publishes it."""
 
 
 class SpaceGuard:
@@ -112,12 +119,15 @@ class SpaceGuard:
         if size > self._budget.max_staging:
             raise BudgetError(f"lesson needs {size / GIB:.1f} GiB, staging cap is {self._budget.max_staging / GIB:.0f}")
         self._dir.mkdir(parents=True, exist_ok=True)
-        announced = False
+        announced, waited = False, 0
         while (reason := self._admit(size)) is not None:
+            if waited >= self._budget.max_wait_seconds:
+                raise AdmissionTimeout(f"waited {waited // 60} min for staging room: {reason}")
             if not announced:
                 self._log(f"paused: {reason}")
                 announced = True
             self._sleep(self._budget.poll_seconds)
+            waited += self._budget.poll_seconds
         if announced:
             self._log("resumed: staging has room")
         try:

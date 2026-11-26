@@ -6,7 +6,7 @@ from course_exporter import media
 from course_exporter.model import Asset, Lesson, LessonRef, Media, UnsupportedMedia
 from contextlib import contextmanager
 
-from course_exporter.publish import BudgetError, PublishError
+from course_exporter.publish import AdmissionTimeout, BudgetError, PublishError
 from course_exporter.runner import Exporter, ExportOptions, estimate_bytes
 from course_exporter.state import CourseState, VerifiedFile
 
@@ -149,10 +149,20 @@ class ExporterTest(unittest.TestCase):
                                Lesson(ref(3), "available", "", (video("v3"),)), broken={"L2"})
         summary = self.exporter(provider).run(self.options())
         self.assertEqual(summary.lessons, {"gated": 1, "failed": 1, "done": 1})
+        self.assertEqual(summary.gaps, 1, "a gated lesson is missing from the archive")
         failure = next(line for line in self.logs if "extract failed" in line)
         self.assertIn("<url>", failure)
         self.assertNotIn("SECRET", " ".join(self.logs))
 
+
+    def test_no_room_within_the_wait_stops_the_run_for_a_rerun(self):
+        provider = self.course(Lesson(ref(1), "available", "", (video("v1"),)),
+                               Lesson(ref(2), "available", "", (video("v2"),)))
+        summary = self.exporter(provider, space=FakeSpace(no_room=True)).run(self.options())
+        self.assertIn("waited 60 min", summary.stopped)
+        self.assertEqual(summary.lessons, {"partial": 1, "discovered": 1})
+        self.assertFalse(summary.complete)
+        self.assertEqual(self.fetched, [])
 
     def test_rediscovery_reopens_a_gated_lesson_the_owner_unlocked(self):
         provider = self.course(Lesson(ref(1), "gated", "", ()), Lesson(ref(2), "available", "", (video("v2"),)))
@@ -255,11 +265,13 @@ class FakePublisher:
 
 
 class FakeSpace:
-    def __init__(self, too_big=False) -> None:
-        self.too_big, self.sizes, self.floor, self.allowances = too_big, [], None, []
+    def __init__(self, too_big=False, no_room=False) -> None:
+        self.too_big, self.no_room, self.sizes, self.floor, self.allowances = too_big, no_room, [], None, []
 
     @contextmanager
     def reserve(self, size):
+        if self.no_room:
+            raise AdmissionTimeout("waited 60 min for staging room: staging would hold 5.2 GiB, cap 5")
         if self.too_big:
             raise BudgetError("lesson needs 9.0 GiB, staging cap is 5")
         self.sizes.append(size)

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from course_exporter.publish import GIB, BudgetError, DrivePublisher, PublishError, SpaceBudget, SpaceGuard
+from course_exporter.publish import GIB, AdmissionTimeout, BudgetError, DrivePublisher, PublishError, SpaceBudget, SpaceGuard
 from course_exporter.state import VerifiedFile
 
 
@@ -97,6 +97,16 @@ class SpaceGuardTest(unittest.TestCase):
         self.assertEqual(len(sleeps), 1, "24 GiB free minus 3 reserved minus 2 wanted is under the 20 GiB floor")
         self.assertTrue(logs[0].startswith("paused: 21.0 GiB free after other reservations"), logs)
         self.assertEqual(logs[-1], "resumed: staging has room")
+
+    def test_a_lesson_that_never_gets_room_gives_up_after_the_wait(self):
+        sleeps = []
+        guard = self.guard(free=30 * GIB, used=5 * GIB, pid=os.getpid(), sleeps=sleeps)
+        with self.assertRaises(AdmissionTimeout) as raised:
+            with guard.reserve(GIB):
+                pass
+        self.assertEqual(sum(sleeps), 3600)
+        self.assertIn("waited 60 min", str(raised.exception))
+        self.assertEqual(list((self.root / ".reservations").glob("*.json")), [])
 
     def test_a_reservation_ends_with_its_lesson(self):
         guard = self.guard(free=30 * GIB, pid=os.getpid())

@@ -10,7 +10,7 @@ from typing import Callable, Generator, Protocol, Sequence
 
 from . import media
 from .model import Asset, Browser, Lesson, LessonRef, Provider, UnsupportedMedia
-from .publish import BudgetError, DrivePublisher, PublishError, SpaceGuard
+from .publish import AdmissionTimeout, BudgetError, DrivePublisher, PublishError, SpaceGuard
 from .state import CourseState, LessonStatus, VerifiedFile
 
 MIB = 1 << 20
@@ -49,7 +49,7 @@ class ExportSummary:
     complete: bool
     """Every lesson finished (published, or done without a publisher, or gated), no asset failed, index uploaded."""
     gaps: int
-    """Assets recorded as unsupported (DRM, encryption, unknown player): finished, but not in the archive."""
+    """Unsupported assets (DRM, encryption, unknown player) plus gated lessons: finished, but not in the archive."""
     stopped: str | None = None
     """Why the staging budget ended the run early; a rerun resumes at that lesson."""
 
@@ -116,7 +116,7 @@ class Exporter:
                 files = self._export_assets(lesson, options, abort)
         except BudgetError as error:
             return self._fail_lesson(ref, progress, "over the staging budget", error)
-        except media.Aborted as reason:
+        except (media.Aborted, AdmissionTimeout) as reason:
             self._stopped = str(reason)
             self._state.set_lesson(ref.lesson_id, "partial", f"stopped: {reason}")
             self._log(f"{progress} {ref.title}: stopped, staging budget: {reason}; rerun resumes here")
@@ -220,7 +220,8 @@ class Exporter:
         complete = (set(counts["lessons"]) <= self._finished and not counts["assets"].get("failed")
                     and self._index_uploaded)
         return ExportSummary(lessons=counts["lessons"], assets=counts["assets"], complete=complete and not self._stopped,
-                             gaps=counts["assets"].get("unsupported", 0), stopped=self._stopped)
+                             gaps=counts["assets"].get("unsupported", 0) + counts["lessons"].get("gated", 0),
+                             stopped=self._stopped)
 
 
 def estimate_bytes(assets: Sequence[Asset], max_height: int) -> int:
