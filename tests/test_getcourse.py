@@ -1,11 +1,14 @@
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import call, patch
+from urllib.parse import urlsplit
 
 from course_exporter.media import DownloadError
 from course_exporter.model import Asset, BrowserError, LessonRef, UnsupportedMedia
 from course_exporter.providers.getcourse import GetCourseProvider
+from course_exporter.state import CourseState
 
 
 ORIGIN = "https://example.test"
@@ -84,6 +87,46 @@ class GetCourseTests(unittest.TestCase):
         with self.assertRaisesRegex(BrowserError, "requires sign-in"):
             self.provider.extract(browser, self.ref)
 
+    def test_lesson_rows_include_locked_lessons_with_no_anchor(self):
+        root = stream(ORIGIN, 10)
+
+        def projection(script):
+            self.assertIn('li[class*="lesson-id-"]', script)
+            self.assertIn(".link.title", script)
+            self.assertIn(".lesson-list__video-watched", script)
+            self.assertIn("user-state-not_reached", script)
+            return {"links": [
+                {"lessonId": "20", "title": "Introduction", "text": "Дата и время начала\nIntroduction"},
+                {"lessonId": "21", "title": "Current lesson", "gated": False},
+                {"lessonId": "22", "title": "Locked lesson", "gated": True},
+                {"url": "/teach/control/lesson/view/id/23", "text": "Дата и время начала\nAnother lesson"},
+            ]}
+
+        browser = FixtureBrowser({root: projection, f"{ORIGIN}/teach/control/lesson/view/id/21": {"html": "<p>Text</p>"}})
+        refs = self.provider.discover(browser, root)
+        self.assertEqual([(ref.lesson_id, ref.order, ref.title) for ref in refs], [
+            ("20", (1,), "Introduction"), ("21", (2,), "Current lesson"),
+            ("22", (3,), "Locked lesson"), ("23", (4,), "Another lesson"),
+        ])
+        self.assertEqual(urlsplit(refs[2].url).path, "/teach/control/lesson/view/id/22")
+        self.assertEqual(self.provider.extract(browser, refs[1]).status, "available")
+        self.assertEqual([url for url, _ in browser.calls], [root, f"{ORIGIN}/teach/control/lesson/view/id/21"])
+
+        with TemporaryDirectory() as directory:
+            state = CourseState(Path(directory) / "state.sqlite3")
+            try:
+                state.record_discovery(refs)
+                saved_ref = state.lessons()[2][0]
+            finally:
+                state.close()
+        resumed = GetCourseProvider()
+        locked_browser = FixtureBrowser({})
+        lesson = resumed.extract(locked_browser, saved_ref)
+        self.assertEqual((lesson.status, lesson.html, lesson.assets), ("gated", "", ()))
+        with self.assertRaisesRegex(UnsupportedMedia, "gated"):
+            resumed.resolve(locked_browser, saved_ref, self.video)
+        self.assertEqual(locked_browser.calls, [])
+
     def test_extracts_sanitized_html_and_opaque_asset_ids(self):
         attachment = "https://cdn.example.test/download?sig=placeholder"
         browser = FixtureBrowser({LESSON: {
@@ -115,6 +158,29 @@ class GetCourseTests(unittest.TestCase):
         self.assertEqual((lesson.status, lesson.html, lesson.assets), ("gated", "", ()))
         with self.assertRaisesRegex(UnsupportedMedia, "gated"):
             self.provider.resolve(browser, self.ref, self.video)
+
+    def test_video_roots_use_projected_frame_order_and_resolve_the_video_url(self):
+        second = "https://vh-api-1-de.gceuproxy.com/sign-player/second?sig=fixture"
+
+        def projection(script):
+            self.assertIn("page.querySelectorAll('.vhi-root, iframe')", script)
+            self.assertIn("data-iframe-src", script)
+            return {
+                "html": '<video src="asset:video-1"></video><video src="asset:video-2"></video>',
+                "frames": [{"title": "First", "url": PLAYER}, {"title": "Second", "url": second}],
+            }
+
+        browser = FixtureBrowser({LESSON: projection})
+        lesson = self.provider.extract(browser, self.ref)
+        self.assertEqual([(asset.ref, asset.title) for asset in lesson.assets], [
+            ("video-1", "First"), ("video-2", "Second"),
+        ])
+        self.assertIn('src="asset:video-2"', lesson.html)
+        html = player_html({"masterPlaylistUrl": "https://cdn.example.test/video.m3u8"})
+        with patch(FETCH_PLAYER, return_value=html) as fetch:
+            self.provider.resolve(browser, self.ref, lesson.assets[1])
+        fetch.assert_called_once_with(second, {"Referer": f"{ORIGIN}/"})
+        self.assertTrue(all("sig=" not in script for _, script in browser.calls))
 
     def test_signed_player_is_resolved_again_for_each_attempt(self):
         pages = [

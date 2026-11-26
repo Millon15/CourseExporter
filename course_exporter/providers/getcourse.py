@@ -15,6 +15,7 @@ from ..model import Asset, AssetKind, Browser, BrowserError, Lesson, LessonRef, 
 
 
 _PAGE_PATH = re.compile(r"/(?:pl/)?teach/control/(stream|lesson)/view(?:/id/([0-9]+))?/?\Z")
+_GATED_FRAGMENT = "course-exporter-gated"
 _PLAYER_HOST = re.compile(r"vh-api-[0-9]+(?:-[a-z0-9]+)*\.gceuproxy\.com\Z")
 _PLAYER_HOSTS = {"player02.getcourse.ru", "cf-api-2.vhcdn.com"}
 _PLAYER_ASSIGNMENT = re.compile(r"\bwindow\s*\.\s*configs\s*=\s*(?=\{)")
@@ -49,20 +50,41 @@ _FETCH_PAGE = r"""(async (url, project) => {
 
 _DISCOVER = r"""(page, absolute) => {
     const main = page.querySelector('.main-page-block, main') || page.body;
-    const label = anchor => {
-        const copy = anchor.cloneNode(true);
+    const lessonItem = 'li[class*="lesson-id-"]';
+    const excluded = 'nav, .breadcrumb, .breadcrumbs, .lesson-navigation';
+    const label = element => {
+        const copy = element.cloneNode(true);
+        copy.querySelectorAll('.lesson-date, .lesson-list__video-watched, .lesson-status, .state-icon-block')
+            .forEach(node => node.remove());
         copy.querySelectorAll('div, p, br, li').forEach(node => {
             node.before('\n');
             if (node.tagName !== 'BR') node.after('\n');
         });
         return copy.textContent.trim();
     };
+    const links = [];
+    for (const element of main.querySelectorAll('a[href], ' + lessonItem)) {
+        if (element.closest(excluded)) continue;
+        if (element.matches(lessonItem)) {
+            const token = [...element.classList].find(name => /^lesson-id-[0-9]+$/.test(name));
+            if (!token) continue;
+            const title = element.querySelector('.link.title');
+            const text = label(title || element)
+                .replace(/^(?:Недоступен|Необходимо выполнить задание)\s*\(стоп-урок\)\s*/iu, '');
+            links.push({
+                lessonId: token.slice('lesson-id-'.length),
+                title: title ? text.replace(/\s+/g, ' ').trim() : '',
+                text,
+                gated: element.classList.contains('user-state-not_reached'),
+            });
+        } else if (!element.closest(lessonItem)) {
+            links.push({text: label(element), url: absolute(element.getAttribute('href'))});
+        }
+    }
     return {
         login: !!page.querySelector('form[action*="/login"], form.state-login'),
         title: main.querySelector('h1')?.textContent.trim() || page.title,
-        links: [...main.querySelectorAll('a[href]')]
-            .filter(a => !a.closest('nav, .breadcrumb, .breadcrumbs, .lesson-navigation'))
-            .map(a => ({text: label(a), url: absolute(a.getAttribute('href'))})),
+        links,
     };
 }"""
 
@@ -75,7 +97,7 @@ _LESSON = r"""(page, absolute) => {
         '.lt-lesson-mission', '.lesson-navigation', '.lesson-access-denied',
         'script', 'style', 'template',
     ].join(', ');
-    const frames = [], videos = [], assets = [], markup = [];
+    const frames = [], videos = [], assets = [], markup = [], outsidePlayers = [];
     const seen = new Map();
     const counts = {image: 0, file: 0};
     const add = (kind, url, label) => {
@@ -91,26 +113,32 @@ _LESSON = r"""(page, absolute) => {
         placeholder.setAttribute('src', 'asset:' + id);
         placeholder.title = label;
         element.replaceWith(placeholder);
+        return placeholder;
     };
+    for (const element of page.querySelectorAll('.vhi-root, iframe')) {
+        if (element.closest(excluded) || element.parentElement?.closest('.vhi-root')) continue;
+        const root = element.matches('.vhi-root');
+        const iframe = root ? element.querySelector('iframe') : element;
+        const url = absolute(element.getAttribute('data-iframe-src') || '')
+            || absolute(iframe?.getAttribute('src')) || absolute(iframe?.getAttribute('data-src'));
+        const videoBlock = element.closest('.lt-video, .lesson-video, .video-player')
+            || element.matches('iframe.vhi-iframe, iframe.js--vhi-iframe');
+        if (!root && !videoBlock && !(url && /^\/sign-player(?:\/|$)/.test(new URL(url).pathname))) continue;
+        const index = frames.length + 1;
+        const label = iframe?.title || 'Video ' + index;
+        const insideContent = !!element.closest(content);
+        frames.push({title: label, url});
+        const placeholder = videoPlaceholder(element, 'video-' + index, label);
+        if (!insideContent) outsidePlayers.push(placeholder.outerHTML);
+    }
     for (const root of page.querySelectorAll(content)) {
         if (root.parentElement?.closest(content) || root.closest(excluded)) continue;
         const copy = root.cloneNode(true);
-        copy.querySelectorAll(excluded).forEach(element => element.remove());
-        for (const element of copy.querySelectorAll('iframe, video, img, a[href]')) {
+        copy.querySelectorAll(excluded + ', iframe').forEach(element => element.remove());
+        for (const element of copy.querySelectorAll('video, img, a[href]')) {
             if (!copy.contains(element)) continue;
-            if (element.matches('iframe')) {
-                const url = absolute(element.getAttribute('data-src') || element.getAttribute('src'));
-                const player = url && new URL(url);
-                const inVideoBlock = element.closest('.lt-video, .lesson-video, .video-player');
-                if (!inVideoBlock && (!player || !/^\/sign-player(?:\/|$)/.test(player.pathname))) {
-                    element.remove();
-                    continue;
-                }
-                const id = 'video-' + (frames.length + 1);
-                const label = element.title || 'Video ' + (frames.length + 1);
-                frames.push({title: label, url});
-                videoPlaceholder(element, id, label);
-            } else if (element.matches('video')) {
+            if (element.matches('video')) {
+                if (element.getAttribute('src')?.startsWith('asset:video-')) continue;
                 const sources = [element, ...element.querySelectorAll('source[src]')].map(source => ({
                     url: absolute(source.getAttribute('src')),
                     type: source.getAttribute('type') || '',
@@ -145,7 +173,7 @@ _LESSON = r"""(page, absolute) => {
     return {
         login: !!page.querySelector('form[action*="/login"], form.state-login'),
         gated: !!page.querySelector('.lesson-access-denied, .lesson-not-available, .lesson-locked'),
-        html: markup.join('\n'),
+        html: [...markup, ...outsidePlayers].join('\n'),
         frames, videos, assets,
     };
 }"""
@@ -310,7 +338,11 @@ def _link_title(value: Any, kind: str, page_id: str) -> str:
     else:
         lines = [
             line for line in lines
-            if not re.match(r"\s*(?:просмотрен\s*$|откроется\b|необходимо выполнить задание\b)", line, re.I)
+            if not re.match(
+                r"\s*(?:просмотрен[оа]?\s*$|откроется\b|дата и время начала\b|необходимо выполнить задание\b)",
+                line,
+                re.I,
+            )
         ]
     return next((line.strip() for line in lines if line.strip()), page_id)
 
@@ -371,7 +403,11 @@ class GetCourseProvider:
                 modules += (_label(page.get("title"), label),)
             position = 0
             for link in _rows(page, "links"):
-                child = _page(link.get("url"), root_url)
+                lesson_id = link.get("lessonId")
+                if isinstance(lesson_id, str) and re.fullmatch(r"[0-9]+", lesson_id):
+                    child = _page(f"/teach/control/lesson/view/id/{lesson_id}", root_url)
+                else:
+                    child = _page(link.get("url"), root_url)
                 if child is None:
                     continue
                 kind, page_id, child_url = child
@@ -381,16 +417,21 @@ class GetCourseProvider:
                 seen.add(page_id)
                 position += 1
                 child_order = (*order, position)
-                title = _link_title(link.get("text"), kind, page_id)
+                title = _label(link.get("title"), _link_title(link.get("text"), kind, page_id))
                 if kind == "stream":
                     visit(child_url, child_order, modules, title)
                 else:
+                    if link.get("gated") is True:
+                        # Keep the gate in the saved reference without changing the lesson path.
+                        child_url += f"#{_GATED_FRAGMENT}"
                     lessons.append(LessonRef(self.name, course_id, page_id, child_order, title, child_url, modules))
 
         visit(root_url, (), (), course_id)
         return lessons
 
     def extract(self, browser: Browser, ref: LessonRef) -> Lesson:
+        if urlsplit(ref.url).fragment == _GATED_FRAGMENT:
+            return Lesson(ref, "gated", "")
         page = _read(browser, ref.url, _LESSON)
         if page.get("gated"):
             return Lesson(ref, "gated", "")
@@ -399,6 +440,8 @@ class GetCourseProvider:
         return Lesson(ref, "available", sanitize_html(html) if isinstance(html, str) else "", assets)
 
     def resolve(self, browser: Browser, ref: LessonRef, asset: Asset) -> Media:
+        if urlsplit(ref.url).fragment == _GATED_FRAGMENT:
+            raise UnsupportedMedia("GetCourse lesson is gated")
         page = _read(browser, ref.url, _LESSON)
         if page.get("gated"):
             raise UnsupportedMedia("GetCourse lesson is gated")
