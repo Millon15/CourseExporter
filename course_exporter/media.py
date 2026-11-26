@@ -35,6 +35,8 @@ URL_PATTERN = re.compile(r"[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
 VIDEO_TIMEOUT_SECONDS = 6 * 3600
 FILE_TIMEOUT_SECONDS = 600
 CHUNK = 1 << 20
+LOCAL_ONLY = ["-protocol_whitelist", "file", "-format_whitelist", "mov,mp4,m4a,3gp,3g2,mj2"]
+"""ffprobe and ffmpeg may read only the local file, and only as MP4: a playlist posing as a video fetches nothing."""
 CHECK_EVERY = 8 << 20
 MANIFEST_BYTES = 1 << 18
 TEXT_BYTES = 4 << 20
@@ -403,8 +405,8 @@ def set_aside(path: Path) -> Path:
 
 
 def _probe_video(path: Path, tools: Tools, run: Runner, expected_seconds: float | None) -> float:
-    result = run([tools.ffprobe, "-v", "error", "-print_format", "json", "-show_streams", "-show_format", str(path)],
-                 capture_output=True, text=True, timeout=300)
+    result = run([tools.ffprobe, "-v", "error", *LOCAL_ONLY, "-print_format", "json", "-show_streams", "-show_format",
+                  str(path)], capture_output=True, text=True, timeout=300)
     if result.returncode != 0:
         raise VerificationError(f"{path.name}: ffprobe exit {result.returncode}: {redact(result.stderr)}")
     probe = json.loads(result.stdout or "{}")
@@ -422,8 +424,8 @@ def _probe_video(path: Path, tools: Tools, run: Runner, expected_seconds: float 
 
 
 def _decode_video(path: Path, tools: Tools, run: Runner) -> None:
-    result = run([tools.ffmpeg, "-nostdin", "-v", "error", "-xerror", "-protocol_whitelist", "file", "-i", str(path),
-                  "-f", "null", "-"], capture_output=True, text=True, timeout=VIDEO_TIMEOUT_SECONDS)
+    result = run([tools.ffmpeg, "-nostdin", "-v", "error", "-xerror", *LOCAL_ONLY, "-i", str(path), "-f", "null", "-"],
+                 capture_output=True, text=True, timeout=VIDEO_TIMEOUT_SECONDS)
     if result.returncode != 0 or result.stderr.strip():
         raise VerificationError(f"{path.name}: decode failed: {redact(result.stderr)}")
 

@@ -224,8 +224,12 @@ class MediaTest(unittest.TestCase):
             return Recorder(done(stdout=json.dumps({"streams": [{"codec_type": k} for k in streams],
                                                     "format": {"duration": duration}})))
 
-        verified = media.verify(path, "video", expected_seconds=776, run=probe(["video", "audio"], "776.32"))
+        run = probe(["video", "audio"], "776.32")
+        verified = media.verify(path, "video", expected_seconds=776, run=run)
         self.assertEqual((verified.bytes, verified.duration), (10, 776.32))
+        args = run.calls[0][0]
+        self.assertEqual(args[args.index("-protocol_whitelist") + 1], "file", "ffprobe reads only the local file")
+        self.assertIn("-format_whitelist", args)
         for streams, duration in ((["video"], "776"), (["audio"], "776"), (["video", "audio"], "0"),
                                   (["video", "audio"], "400")):
             with self.assertRaises(media.VerificationError, msg=f"{streams} {duration}"):
