@@ -78,7 +78,7 @@ class DrivePublisher:
         return files
 
     def _call(self, verb: str, source: str, target: str, *extra: str) -> None:
-        args = [self._rclone, verb, source, target, "--checksum", "--retries", "5", "--low-level-retries", "20", *extra]
+        args = [self._rclone, verb, source, target, "--checksum", "--retries", "5", "--low-level-retries", "500", *extra]
         result = self._run(args, capture_output=True, text=True, timeout=6 * 3600)
         if result.returncode != 0:
             raise PublishError(f"rclone {verb} exit {result.returncode}: {redact(result.stderr, 400)}")
