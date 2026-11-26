@@ -9,26 +9,35 @@ log=$1
 shift
 retry_seconds=${RETRY_SECONDS:-600}
 max_idle=${MAX_IDLE:-6}
-cd "$(dirname "$0")/.." || exit 2
+# A systemd user service starts with a minimal PATH; yt-dlp and openclaw live in the user's own bin directories.
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 
-published() { jq -r '.lessons.published // 0' <<<"$1" 2>/dev/null || echo 0; }
+cd "$(dirname "$0")/.." || exit 2
+exec 3>>"$log" || exit 2
+attempt_out="$log.attempt"
+: >"$attempt_out" || exit 2
+for tool in python3 yt-dlp ffmpeg ffprobe rclone jq openclaw; do
+    command -v "$tool" >/dev/null || { printf '=== missing %s on PATH %s\n' "$tool" "$PATH" >&3; exit 2; }
+done
 
 idle=0
 last=-1
 attempt=0
 while :; do
     attempt=$((attempt + 1))
-    printf '=== attempt %d at %s\n' "$attempt" "$(date -u +%FT%TZ)" >>"$log"
-    python3 -m course_exporter export --rediscover "$@" >>"$log" 2>&1
-    code=$?
-    summary=$(grep -E '^\{"lessons"' "$log" | tail -1)
-    printf '=== exit %d\n' "$code" >>"$log"
+    printf '=== attempt %d at %s\n' "$attempt" "$(date -u +%FT%TZ)" >&3
+    python3 -m course_exporter export --rediscover "$@" 2>&1 | tee "$attempt_out" >&3
+    code=${PIPESTATUS[0]}
+    printf '=== exit %d\n' "$code" >&3
     [[ $code -eq 1 ]] || exit "$code"
-    now=$(published "$summary")
+    summary=$(grep -E '^\{"lessons"' "$attempt_out" | tail -1)
+    now=$(jq -r '.lessons.published // 0' <<<"${summary:-{\}}" 2>/dev/null || echo 0)
     if ((now > last)); then idle=0; else idle=$((idle + 1)); fi
     last=$now
     if ((idle >= max_idle)); then
-        printf '=== giving up: %d attempts in a row published nothing\n' "$idle" >>"$log"
+        printf '=== giving up: %d attempts in a row published nothing\n' "$idle" >&3
         exit 1
     fi
     sleep "$retry_seconds"

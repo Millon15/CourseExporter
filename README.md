@@ -27,10 +27,11 @@ floor or staging cap is reached mid-download, or when three lessons in a row fai
 
 For a full course, `scripts/export-loop.sh` reruns the export with `--rediscover` until it ends with anything but exit
 1, waiting `RETRY_SECONDS` (600) between attempts and giving up after `MAX_IDLE` (6) attempts in a row that publish no
-new lesson. Under systemd it survives the login session:
+new lesson. It sets its own PATH and checks its tools first, so it runs the same under systemd, which keeps it alive
+after the login session ends:
 
 ```sh
-systemd-run --user --unit course-<folder> scripts/export-loop.sh <staging_root>/<folder>.log \
+systemd-run --user --unit course-<folder> <repo>/scripts/export-loop.sh <staging_root>/<folder>.log \
   --provider kwiga --course <course URL> --name <folder> --out <staging_root>/<folder> --decode
 ```
 
