@@ -83,7 +83,7 @@ def opener_for(pages):
 
 
 def selection(*formats):
-    return done(stdout=json.dumps({"id": "v", "requested_formats": list(formats)}))
+    return done(stdout=json.dumps({"id": "v", "format_id": "2560-0+audio", "requested_formats": list(formats)}))
 
 
 def hls(url):
@@ -122,6 +122,18 @@ class MediaTest(unittest.TestCase):
         self.assertEqual(popen.calls[0][popen.calls[0].index("--downloader") + 1], "native")
         self.assertEqual([f["url"] for f in popen.loaded["requested_formats"]], [VIDEO_PLAYLIST, AUDIO_PLAYLIST])
         self.assertEqual(list(self.dir.glob(".info-*")), [], "the signed info file is gone after the run")
+
+    def test_the_download_is_pinned_to_the_checked_format(self):
+        popen = FakePopen(self.dir / "v1.mp4")
+        self.download(Recorder(selection(hls(VIDEO_PLAYLIST), hls(AUDIO_PLAYLIST))), popen)
+        self.assertEqual(popen.calls[0][popen.calls[0].index("-f") + 1], "2560-0+audio")
+
+    def test_a_selection_without_a_format_id_downloads_nothing(self):
+        unnamed = done(stdout=json.dumps({"id": "v", "requested_formats": [hls(VIDEO_PLAYLIST)]}))
+        popen = FakePopen(self.dir / "v1.mp4")
+        with self.assertRaises(media.DownloadError):
+            self.download(Recorder(unnamed), popen)
+        self.assertEqual(popen.calls, [], "nothing downloads an unchecked choice")
 
     def test_encryption_in_any_selected_playlist_is_unsupported_before_download(self):
         for audio in ("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\nseg.aac\n",

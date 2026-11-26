@@ -294,12 +294,16 @@ def _refuse_keys(playlist: str) -> None:
 
 def _download_selected(info: dict, target: Path, tools: Tools, proxy_url: str, abort: AbortCheck,
                        popen: Callable[..., Any]) -> Path:
-    """Downloads exactly the formats checked above: yt-dlp reloads that info from a 0600 file in the lesson dir."""
+    """Downloads exactly the formats checked above: yt-dlp reloads that info from a 0600 file in the lesson dir and is
+    pinned to the checked format id, since without `-f` it would pick again from every listed format."""
+    format_id = info.get("format_id")
+    if not isinstance(format_id, str) or not format_id:
+        raise DownloadError("yt-dlp format selection named no format id")
     with tempfile.NamedTemporaryFile("w", dir=target.parent, prefix=".info-", suffix=".json", delete=True) as handle:
         json.dump(info, handle)
         handle.flush()
         args = [tools.ytdlp, "--load-info-json", handle.name, "--proxy", proxy_url, "--downloader", "native",
-                "--no-progress", "--no-mtime", "--retries", "10", "--fragment-retries", "20",
+                "-f", format_id, "--no-progress", "--no-mtime", "--retries", "10", "--fragment-retries", "20",
                 "--merge-output-format", "mp4", "-o", str(target)]
         code, stderr = _run_watched(args, abort, popen)
     if code != 0 or not target.is_file():
