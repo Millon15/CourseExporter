@@ -103,9 +103,12 @@ class PublicProxy:
                     refused.append(match.group(1).decode() if match else "non-CONNECT request")
                     self.request.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                     return
-                with socket.create_connection((addresses[0], 443), timeout=30) as upstream:
-                    self.request.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                    _relay(self.request, upstream)
+                try:
+                    with socket.create_connection((addresses[0], 443), timeout=30) as upstream:
+                        self.request.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        _relay(self.request, upstream)
+                except OSError:
+                    return  # a reset tunnel is the client's to retry; the proxy only ends it quietly
 
         self._server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Tunnel)
         self._server.daemon_threads = True
