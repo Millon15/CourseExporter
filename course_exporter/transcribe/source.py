@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -281,13 +282,14 @@ def _ffmpeg(ffmpeg: str, inputs: list[str], out: Path) -> Iterator[subprocess.Po
 
 @contextmanager
 def _loopback_proxy(api: DriveApi, file_id: str) -> Iterator[str]:
-    """Serves one Drive file on 127.0.0.1 with Range support; only this file ID is reachable through it."""
-    handler = type("SourceProxy", (_ProxyHandler,), {"api": api, "file_id": file_id})
+    """Serves one Drive file on 127.0.0.1 with Range support, at a random path other local users cannot guess."""
+    path = f"/{secrets.token_urlsafe(32)}/source.mp4"
+    handler = type("SourceProxy", (_ProxyHandler,), {"api": api, "file_id": file_id, "path_token": path})
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_address[1]}/source.mp4"
+        yield f"http://127.0.0.1:{server.server_address[1]}{path}"
     finally:
         server.shutdown()
         server.server_close()
@@ -296,9 +298,13 @@ def _loopback_proxy(api: DriveApi, file_id: str) -> Iterator[str]:
 class _ProxyHandler(BaseHTTPRequestHandler):
     api: DriveApi
     file_id: str
+    path_token: str
     PASSED = ("Content-Length", "Content-Range", "Accept-Ranges", "Content-Type")
 
     def do_GET(self) -> None:
+        if not secrets.compare_digest(self.path, self.path_token):
+            self.send_error(404)
+            return
         try:
             response = self.api.media(self.file_id, self.headers.get("Range"))
         except SourceError:

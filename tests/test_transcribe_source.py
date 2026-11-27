@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
 
 from course_exporter.transcribe import source
@@ -187,6 +188,20 @@ class AudioCacheTest(unittest.TestCase):
         self.assertEqual(audio.read_path, "range")
         self.assertTrue(any(r for r in api.ranges if r))
         self.assertAlmostEqual(audio.seconds, 4.0, delta=0.2)
+
+    def test_the_proxy_serves_only_its_secret_path(self):
+        api = FakeApi(b"0123456789", drive_file(b"0123456789"))
+        with source._loopback_proxy(api, "F1") as url:
+            base = url.rsplit("/", 2)[0]
+            for wrong in (f"{base}/source.mp4", f"{base}/x/source.mp4"):
+                with self.subTest(wrong), self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(wrong, timeout=10)
+                self.assertEqual(caught.exception.code, 404)
+                caught.exception.close()
+            request = urllib.request.Request(url, headers={"Range": "bytes=2-4"})
+            with urllib.request.urlopen(request, timeout=10) as reply:
+                self.assertEqual((reply.status, reply.read()), (206, b"234"))
+        self.assertEqual(api.ranges, ["bytes=2-4"])
 
     def test_discards_audio_whose_stream_differs_from_the_pinned_md5(self):
         data = self.video("-movflags", "+faststart")
