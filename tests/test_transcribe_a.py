@@ -55,29 +55,37 @@ def placed(start, end, speaker="S1", text="одна фраза"):
     return {"start": start, "end": end, "speaker": speaker, "text": text, "flags": []}
 
 
+WINDOW = pipeline_a.Window(1, 10.0, 30.0, 20.0)
+"""Window 1 of `plan(30, 20, 10)`: it starts at 10 and the previous window ends at 20."""
+
+
+def stitched(kept, incoming):
+    return pipeline_a._stitch(kept, incoming, pipeline_a._seam_pairs(kept, incoming, WINDOW), WINDOW)
+
+
 class StitchTest(unittest.TestCase):
-    """Window 1 of `plan(30, 20, 10)`: it starts at 10 and the previous window ends at 20."""
+    def test_keeps_one_copy_of_an_utterance_heard_by_both_windows(self):
+        cases = {"jitter": ((13.0, 16.0), (14.0, 17.0)), "mirror": ((14.0, 17.0), (13.0, 16.0)),
+                 "short pair across the cut": ((14.6, 15.1), (14.9, 15.4))}
+        for name, (old, new) in cases.items():
+            with self.subTest(name):
+                joined = stitched([placed(*old)], [placed(*new)])
+                self.assertEqual([s["flags"] for s in joined], [[]])
 
-    WINDOW = pipeline_a.Window(1, 10.0, 30.0, 20.0)
+    def test_pairs_a_phrase_the_later_window_heard_only_in_part(self):
+        kept = [placed(8.0, 14.0, text="один два три"), placed(14.1, 19.0, text="четыре пять")]
+        incoming = [placed(10.0, 14.2, text="два три"), placed(14.2, 19.5, text="четыре пять"),
+                    placed(19.5, 25.0, text="шесть")]
+        self.assertEqual([(s["text"], s["flags"]) for s in sorted(stitched(kept, incoming), key=lambda s: s["start"])],
+                         [("один два три", []), ("четыре пять", []), ("шесть", [])])
 
-    def test_keeps_one_copy_of_an_utterance_whose_timestamps_jitter_across_the_middle(self):
-        for old, new in (((13.0, 16.0), (14.0, 17.0)), ((14.0, 17.0), (13.0, 16.0))):
-            with self.subTest(old=old, new=new):
-                joined = pipeline_a._stitch([placed(*old)], [placed(*new)], self.WINDOW)
-                self.assertEqual(len(joined), 1)
-                self.assertEqual(joined[0]["flags"], [])
+    def test_keeps_and_flags_an_utterance_only_one_window_heard(self):
+        joined = stitched([placed(12.0, 18.0)], [])
+        self.assertEqual([(s["start"], s["flags"]) for s in joined], [(12.0, ["seam_unresolved"])])
 
-    def test_cuts_at_a_gap_both_windows_share(self):
-        kept = [placed(8.0, 14.0, text="a"), placed(14.1, 19.0, text="b")]
-        incoming = [placed(10.0, 14.2, text="a2"), placed(14.2, 19.5, text="b2"), placed(19.5, 25.0, text="c")]
-        self.assertEqual([s["text"] for s in pipeline_a._stitch(kept, incoming, self.WINDOW)], ["a", "b2", "c"])
-
-    def test_flags_the_overlap_when_no_cut_is_free(self):
-        kept = [placed(9.0, 20.5, text="long")]
-        incoming = [placed(10.0, 16.0, text="x"), placed(16.0, 22.0, text="y")]
-        joined = pipeline_a._stitch(kept, incoming, self.WINDOW)
-        self.assertEqual([(s["text"], s["flags"]) for s in joined],
-                         [("long", ["seam_unresolved"]), ("y", ["seam_unresolved"])])
+    def test_flags_the_kept_side_of_a_contradiction(self):
+        joined = stitched([placed(12.0, 18.0, text="альфа бета")], [placed(13.0, 19.0, text="гамма дельта")])
+        self.assertEqual([(s["text"], s["flags"]) for s in joined], [("гамма дельта", ["seam_unresolved"])])
 
     def test_numbers_speakers_after_sorting_by_start(self):
         joined = [placed(14.0, 15.0, "S1"), placed(12.0, 19.0, "S2")]
@@ -86,17 +94,40 @@ class StitchTest(unittest.TestCase):
 
 
 class LabelMapTest(unittest.TestCase):
-    WINDOW = pipeline_a.Window(1, 10.0, 30.0, 20.0)
+    REFS = {"S1": Path("s1.wav"), "S2": Path("s2.wav")}
 
-    def test_an_unnamed_label_is_ambiguous_while_a_known_speaker_lacks_a_reference(self):
-        raw = [seg(0.0, 3.0, "A")]
-        with self.assertRaisesRegex(pipeline_a.PipelineError, "ambiguous"):
-            pipeline_a._label_map(raw, {"S1": Path("r.wav")}, ["S1", "S2"], ["S2"], self.WINDOW)
+    def labels(self, kept, incoming, voices, known):
+        pairs = pipeline_a._seam_pairs(kept, incoming, WINDOW)
+        return pipeline_a._label_map(incoming, kept, pairs, voices, known, WINDOW)
 
-    def test_named_labels_map_to_themselves_and_new_ones_continue_the_count(self):
-        raw = [seg(0.0, 3.0, "S1"), seg(3.0, 6.0, "A"), seg(6.0, 9.0, "B")]
-        labels = pipeline_a._label_map(raw, {"S1": Path("r.wav"), "S2": Path("q.wav")}, ["S1", "S2"], [], self.WINDOW)
-        self.assertEqual(labels, {"S1": "S1", "A": "S3", "B": "S4"})
+    def test_a_new_label_paired_with_an_earlier_speaker_is_that_speaker(self):
+        kept = [placed(0.0, 3.0, "S1", "начало"), placed(16.0, 18.0, "S1", "та же фраза")]
+        incoming = [placed(16.0, 18.0, "A", "та же фраза"), placed(22.0, 23.0, "A", "потом")]
+        self.assertEqual(self.labels(kept, incoming, {"S1": Path("s1.wav")}, ["S1"]), {"A": "S1"})
+
+    def test_new_labels_continue_the_count(self):
+        incoming = [placed(21.0, 22.0, "S1", "раз"), placed(23.0, 24.0, "A", "два"), placed(25.0, 26.0, "B", "три")]
+        self.assertEqual(self.labels([placed(0.0, 5.0, "S1"), placed(5.0, 9.0, "S2")], incoming, self.REFS,
+                                     ["S1", "S2"]), {"S1": "S1", "A": "S3", "B": "S4"})
+
+    def test_ambiguous_mappings_fail_the_item(self):
+        cases = {
+            "unreferenced earlier speaker": ([placed(0.0, 1.0, "S1")], [placed(22.0, 23.0, "A")], {}, ["S1"]),
+            "reference paired with another speaker": (
+                [placed(0.0, 5.0, "S1"), placed(16.0, 18.0, "S1", "та же фраза")],
+                [placed(16.0, 18.0, "S2", "та же фраза")], self.REFS, ["S1", "S2"]),
+            "one label paired with two speakers": (
+                [placed(12.0, 14.0, "S1", "первая фраза"), placed(16.0, 18.0, "S2", "вторая фраза")],
+                [placed(12.0, 14.0, "A", "первая фраза"), placed(16.0, 18.0, "A", "вторая фраза")],
+                self.REFS, ["S1", "S2"]),
+            "two labels paired into one speaker": (
+                [placed(12.0, 14.0, "S1", "первая фраза"), placed(16.0, 18.0, "S1", "вторая фраза")],
+                [placed(12.0, 14.0, "A", "первая фраза"), placed(16.0, 18.0, "B", "вторая фраза")],
+                {"S1": Path("s1.wav")}, ["S1"]),
+        }
+        for name, (kept, incoming, voices, known) in cases.items():
+            with self.subTest(name), self.assertRaisesRegex(pipeline_a.PipelineError, "ambiguous"):
+                self.labels(kept, incoming, voices, known)
 
 
 class CostTest(unittest.TestCase):
@@ -144,7 +175,7 @@ class TranscriberTest(unittest.TestCase):
             item = queue.pop(0)
             if isinstance(item, Exception):
                 raise item
-            return Reply(item, f"req_{len(self.requests)}")
+            return Reply(item, f"req_{len(self.requests):08d}")
 
         return pipeline_a.Transcriber(KEY, Path(self.tmp.name) / "work", opener=opener, ffmpeg=FFMPEG,
                                       sleep=lambda s: None, max_chunk_seconds=20.0)
@@ -156,11 +187,11 @@ class TranscriberTest(unittest.TestCase):
         usage = {"type": "duration", "seconds": 20}
         doc = self.run_clip(self.transcriber(
             {"segments": [seg(0.0, 5.0, "A", "один"), seg(5.0, 12.0, "B", "два"), seg(12.0, 14.9, "A", "три"),
-                          seg(15.0, 20.0, "B", "дубль")], "usage": usage},
+                          seg(15.0, 20.0, "B", "четыре")], "usage": usage},
             {"segments": [seg(5.0, 9.0, "S2", "четыре"), seg(9.0, 12.0, "S1", "пять"),
                           seg(12.0, 14.8, "A", "новый")], "usage": usage},
             {"segments": [seg(6.0, 9.0, "S3", "шесть"), seg(9.0, 14.0, "S2", "семь")], "usage": usage},
-            {"segments": [seg(2.0, 4.0, "S2", "дубль"), seg(6.0, 10.0, "S1", "восемь")], "usage": usage},
+            {"segments": [seg(2.0, 4.0, "S2", "семь"), seg(6.0, 10.0, "S1", "восемь")], "usage": usage},
         ))
         segments.validate(doc)
         self.assertEqual([(s["start"], s["speaker"], s["text"]) for s in doc["segments"]],
@@ -169,7 +200,7 @@ class TranscriberTest(unittest.TestCase):
                           (29.0, "S2", "семь"), (36.0, "S1", "восемь")])
         self.assertEqual(doc["speakers"], ["S1", "S2", "S3"])
         self.assertEqual(doc["source"]["offset_s"], 100.0)
-        self.assertEqual(doc["run"]["request_ids"], ["req_1", "req_2", "req_3", "req_4"])
+        self.assertEqual(doc["run"]["request_ids"], [f"req_{n:08d}" for n in range(1, 5)])
         self.assertEqual(doc["run"]["usage"]["seconds"], 80)
         self.assertAlmostEqual(doc["run"]["cost_usd"], 0.008)
 
@@ -190,13 +221,18 @@ class TranscriberTest(unittest.TestCase):
         with self.assertRaisesRegex(pipeline_a.PipelineError, "5 speakers"):
             self.run_clip(self.transcriber(crowd))
 
-    def test_a_provider_error_reports_status_and_code_but_not_its_message(self):
-        body = json.dumps({"error": {"message": f"Incorrect API key {KEY} for «урок»", "code": "invalid_api_key"}})
-        denied = urllib.error.HTTPError(pipeline_a.ENDPOINT, 401, "no", {"x-request-id": "req_9"},
-                                        io.BytesIO(body.encode()))
-        with self.assertRaises(pipeline_a.PipelineError) as caught:
-            self.run_clip(self.transcriber(denied))
-        self.assertEqual(str(caught.exception), "OpenAI HTTP 401, request req_9, error code invalid_api_key")
+    def test_a_provider_error_reports_only_known_codes_and_well_formed_request_ids(self):
+        cases = {
+            "known": ({"message": f"Incorrect API key {KEY} for «урок»", "code": "invalid_api_key"}, "req_abc12345",
+                      "OpenAI HTTP 401, request req_abc12345, error code invalid_api_key"),
+            "echoed": ({"message": "no", "code": KEY}, KEY, "OpenAI HTTP 401, request invalid, error code other"),
+        }
+        for name, (error, request_id, expected) in cases.items():
+            body = io.BytesIO(json.dumps({"error": error}).encode())
+            denied = urllib.error.HTTPError(pipeline_a.ENDPOINT, 401, "no", {"x-request-id": request_id}, body)
+            with self.subTest(name), self.assertRaises(pipeline_a.PipelineError) as caught:
+                self.run_clip(self.transcriber(denied))
+            self.assertEqual(str(caught.exception), expected)
 
     def test_retries_throttling_then_fails_on_a_permanent_error(self):
         throttled = urllib.error.HTTPError(pipeline_a.ENDPOINT, 429, "slow", Message(), None)

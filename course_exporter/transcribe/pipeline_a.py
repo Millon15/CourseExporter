@@ -1,12 +1,15 @@
 """Pipeline A: `gpt-4o-transcribe-diarize` over 20-minute chunks, stitched into one `uch-segments/1` document.
 
-- Chunks overlap by 10 s. Two chunks are stitched at a cut inside the overlap that no segment of either chunk
-  crosses, nearest its middle, so one utterance is kept once; with no such cut the middle is used and the overlap's
-  segments carry the `seam_unresolved` flag for the gate.
+- Chunks overlap by 10 s. In the overlap, a segment of each chunk with similar words close in time is one
+  utterance heard twice: the pair keeps one copy. Unpaired segments are split at a cut that no segment crosses,
+  nearest the overlap's middle; one the other chunk does not cover at all is kept wherever it falls. A kept
+  segment the other chunk contradicts (covers with different words), or kept from one side only past the cut,
+  carries the `seam_unresolved` flag for the gate.
 - The model labels speakers per request, so chunk n+1 gets up to four 2-10 s references, cut from earlier chunks'
-  own output, named by the video-wide ids they stand for. A label it returns that is not one of those names is a
-  new speaker, unless an earlier speaker had no 2 s reference: then the mapping is ambiguous and the item fails,
-  as does a fifth speaker before a seam, since at most four carry across.
+  own output, named by the video-wide ids they stand for. A paired utterance also says who a label is: a label
+  paired with one earlier speaker is that speaker. A label paired with two speakers, a reference name paired
+  with another speaker, two labels paired into one speaker, and an unpaired new label while an earlier speaker
+  has no 2 s reference all fail the item as ambiguous; so does a fifth speaker, since at most four carry across.
 - Every raw response, request id and timing lands in `workdir` as the run's receipt; the course audio and text
   there stay private to the owner, since other users share the VPS.
 
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import difflib
 import hashlib
 import json
 import re
@@ -41,6 +45,12 @@ MAX_CHUNK_SECONDS = 1200.0
 OVERLAP_SECONDS = 10.0
 SEAM_TOLERANCE_SECONDS = 0.3
 SEAM_FLAG = "seam_unresolved"
+PAIR_SIMILARITY = 0.6
+PAIR_DISTANCE_SECONDS = 1.5
+REQUEST_ID = re.compile(r"req_[A-Za-z0-9]{8,64}")
+ERROR_CODES = frozenset({"invalid_api_key", "insufficient_quota", "rate_limit_exceeded", "model_not_found",
+                         "invalid_request_error", "server_error", "invalid_value", "unsupported_value",
+                         "audio_too_long", "invalid_file_format", "context_length_exceeded"})
 MAX_UPLOAD_BYTES = 24 * 1000 * 1000
 MAX_REFERENCES = 4
 REFERENCE_SECONDS = (2.0, 10.0)
@@ -105,9 +115,11 @@ class Transcriber:
         receipt, kept, voices, known = Receipt(), [], {}, []
         for window in plan(duration, self._max_chunk_seconds):
             response = self._request(clip, window, voices, receipt)
-            labels = _label_map(response["segments"], voices, known, _unreferenced(kept, voices), window)
+            incoming = _placed(response, window)
+            pairs = _seam_pairs(kept, incoming, window)
+            labels = _label_map(incoming, kept, pairs, voices, known, window)
             known = list(dict.fromkeys([*known, *labels.values()]))
-            kept = _stitch(kept, _placed(response, window, labels), window)
+            kept = _stitch(kept, [{**s, "speaker": labels[s["speaker"]]} for s in incoming], pairs, window)
             voices = self._references(clip, kept, voices)
         merge_began = time.monotonic()
         document = self._document(clip, duration, _renumbered(kept), receipt)
@@ -139,13 +151,13 @@ class Transcriber:
             try:
                 with self._opener(request, timeout=REQUEST_TIMEOUT_SECONDS) as reply:
                     payload = json.load(reply)
-                    receipt.request_ids.append(reply.headers.get("x-request-id", ""))
+                    receipt.request_ids.append(_request_id(reply.headers.get("x-request-id")))
             except urllib.error.HTTPError as exc:
-                request_id = exc.headers.get("x-request-id", "") if exc.headers else ""
+                request_id = _request_id(exc.headers.get("x-request-id") if exc.headers else None)
                 receipt.request_ids.append(request_id)
                 if exc.code not in RETRY_STATUSES or delay is None:
-                    raise PipelineError(f"OpenAI HTTP {exc.code}, request {_token(request_id)}, "
-                                        f"error code {_error_code(exc)}") from None
+                    report = f"OpenAI HTTP {exc.code}, request {request_id}, error code {_error_code(exc)}"
+                    raise PipelineError(report.replace(self._key, "<key>")) from None
                 receipt.retries += 1
                 self._sleep(delay)
                 continue
@@ -184,43 +196,99 @@ class Transcriber:
         (self._workdir / name).write_text(json.dumps(payload, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 
 
-def _label_map(raw_segments: list[dict[str, Any]], voices: dict[str, Path], known: list[str],
-               unreferenced: list[str], window: Window) -> dict[str, str]:
-    """A reference name maps to itself; any other label becomes the next video-wide id after `known`."""
+def _placed(response: dict[str, Any], window: Window) -> list[dict[str, Any]]:
+    """Every non-empty segment of the window, video-relative, still under the model's own label."""
+    return [{"start": round(window.start + float(raw["start"]), 3), "end": round(window.start + float(raw["end"]), 3),
+             "speaker": raw["speaker"], "text": raw["text"].strip(), "flags": []}
+            for raw in response["segments"] if raw["text"].strip()]
+
+
+def _seam_pairs(kept: list[dict[str, Any]], incoming: list[dict[str, Any]], window: Window) -> list[tuple[int, int]]:
+    """(kept index, incoming index) of overlap segments that are one utterance: similar words, close in time."""
+    if window.index == 0:
+        return []
+    olds = [(i, s) for i, s in enumerate(kept) if s["end"] > window.start]
+    news = [(j, s) for j, s in enumerate(incoming) if s["start"] < window.previous_end]
+    scored = sorted(((_similarity(a, b), i, j) for i, a in olds for j, b in news if _close(a, b)), reverse=True)
+    pairs, used_old, used_new = [], set(), set()
+    for score, i, j in scored:
+        if score >= PAIR_SIMILARITY and i not in used_old and j not in used_new:
+            pairs.append((i, j))
+            used_old.add(i)
+            used_new.add(j)
+    return pairs
+
+
+def _label_map(incoming: list[dict[str, Any]], kept: list[dict[str, Any]], pairs: list[tuple[int, int]],
+               voices: dict[str, Path], known: list[str], window: Window) -> dict[str, str]:
+    """Video-wide id per model label: its reference name, the one earlier speaker it pairs with, or a new id."""
+    heard: dict[str, set[str]] = {}
+    for i, j in pairs:
+        heard.setdefault(incoming[j]["speaker"], set()).add(kept[i]["speaker"])
+    unreferenced = _unreferenced(kept, voices)
     labels: dict[str, str] = {}
-    for label in dict.fromkeys(raw["speaker"] for raw in raw_segments):
-        if label not in voices and unreferenced:
-            raise PipelineError(f"window {window.index}: label {label!r} may be {', '.join(unreferenced)}, "
-                                "who had no 2 s reference; the speaker mapping is ambiguous")
-        fresh = [value for value in labels.values() if value not in voices]
-        labels[label] = label if label in voices else f"S{len(known) + len(fresh) + 1}"
+    for label in dict.fromkeys(s["speaker"] for s in incoming):
+        labels[label] = _identify(label, heard.get(label, set()), voices, unreferenced,
+                                  len(known) + sum(1 for v in labels.values() if v not in known) + 1, window)
+    doubled = [v for v in set(labels.values()) if list(labels.values()).count(v) > 1]
+    if doubled:
+        raise PipelineError(f"window {window.index}: two labels pair with {', '.join(sorted(doubled))}; "
+                            "the speaker mapping is ambiguous")
     return labels
+
+
+def _identify(label: str, heard: set[str], voices: dict[str, Path], unreferenced: list[str], next_id: int,
+              window: Window) -> str:
+    if label in voices and heard - {label}:
+        raise PipelineError(f"window {window.index}: reference {label} pairs with {', '.join(sorted(heard))}; "
+                            "the speaker mapping is ambiguous")
+    if label in voices:
+        return label
+    if len(heard) > 1:
+        raise PipelineError(f"window {window.index}: label {label!r} pairs with {', '.join(sorted(heard))}; "
+                            "the speaker mapping is ambiguous")
+    if heard:
+        return next(iter(heard))
+    if unreferenced:
+        raise PipelineError(f"window {window.index}: label {label!r} may be {', '.join(unreferenced)}, "
+                            "who had no 2 s reference; the speaker mapping is ambiguous")
+    return f"S{next_id}"
 
 
 def _unreferenced(kept: list[dict[str, Any]], voices: dict[str, Path]) -> list[str]:
     return [speaker for speaker in dict.fromkeys(s["speaker"] for s in kept) if speaker not in voices]
 
 
-def _placed(response: dict[str, Any], window: Window, labels: dict[str, str]) -> list[dict[str, Any]]:
-    """Every non-empty segment of the window, video-relative, under its video-wide speaker id."""
-    return [{"start": round(window.start + float(raw["start"]), 3), "end": round(window.start + float(raw["end"]), 3),
-             "speaker": labels[raw["speaker"]], "text": raw["text"].strip(), "flags": []}
-            for raw in response["segments"] if raw["text"].strip()]
-
-
-def _stitch(kept: list[dict[str, Any]], incoming: list[dict[str, Any]], window: Window) -> list[dict[str, Any]]:
-    """Joins a window to what came before at one cut inside their overlap; see the module docstring."""
-    low, high = window.start, window.previous_end
-    if window.index == 0 or high <= low:
+def _stitch(kept: list[dict[str, Any]], incoming: list[dict[str, Any]], pairs: list[tuple[int, int]],
+            window: Window) -> list[dict[str, Any]]:
+    """Joins a window to what came before; see the module docstring for the seam rules."""
+    if window.index == 0:
         return kept + incoming
-    near = [s for s in kept if s["end"] > low] + [s for s in incoming if s["start"] < high]
-    cut = _common_gap(near, low, high)
-    resolved = cut is not None
+    low, high = window.start, window.previous_end
+    paired_old, paired_new = {i for i, _ in pairs}, {j for _, j in pairs}
+    loose_old = [s for i, s in enumerate(kept) if i not in paired_old and s["end"] > low]
+    loose_new = [s for j, s in enumerate(incoming) if j not in paired_new and s["start"] < high]
+    cut = _common_gap(loose_old + loose_new, low, high)
     cut = (low + high) / 2 if cut is None else cut
-    joined = [s for s in kept if _middle(s) < cut] + [s for s in incoming if _middle(s) >= cut]
-    if resolved:
-        return joined
-    return [{**s, "flags": [*s["flags"], SEAM_FLAG]} if s["end"] > low and s["start"] < high else s for s in joined]
+    loose = {id(s) for s in loose_old + loose_new}
+    joined = [_seam_side(s, loose_new, cut, before=True) if id(s) in loose else s
+              for i, s in enumerate(kept) if i not in paired_old]
+    joined += [_seam_side(s, loose_old, cut, before=False) if id(s) in loose else s
+               for j, s in enumerate(incoming) if j not in paired_new]
+    joined += [kept[i] if (_middle(kept[i]) + _middle(incoming[j])) / 2 < cut else incoming[j] for i, j in pairs]
+    return [s for s in joined if s is not None]
+
+
+def _seam_side(segment: dict[str, Any], others: list[dict[str, Any]], cut: float,
+               before: bool) -> dict[str, Any] | None:
+    """An unpaired overlap segment: kept on its side of the cut, or anywhere when the other chunk is silent there."""
+    contested = any(_overlaps(segment, other) for other in others)
+    on_its_side = (_middle(segment) < cut) == before
+    if on_its_side and not contested:
+        return segment
+    if on_its_side or not contested:
+        return {**segment, "flags": [*segment["flags"], SEAM_FLAG]}
+    return None
 
 
 def _common_gap(near: list[dict[str, Any]], low: float, high: float) -> float | None:
@@ -229,6 +297,22 @@ def _common_gap(near: list[dict[str, Any]], low: float, high: float) -> float | 
     middle, tolerance = (low + high) / 2, SEAM_TOLERANCE_SECONDS
     open_cuts = [t for t in edges if not any(s["start"] + tolerance < t < s["end"] - tolerance for s in near)]
     return min(open_cuts, key=lambda t: (abs(t - middle), t)) if open_cuts else None
+
+
+def _similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
+    return difflib.SequenceMatcher(None, _words(a["text"]), _words(b["text"])).ratio()
+
+
+def _close(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    return _overlaps(a, b) or abs(_middle(a) - _middle(b)) <= PAIR_DISTANCE_SECONDS
+
+
+def _overlaps(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    return a["start"] < b["end"] and b["start"] < a["end"]
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"\w+", text.lower())
 
 
 def _middle(segment: dict[str, Any]) -> float:
@@ -242,16 +326,19 @@ def _renumbered(kept: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _error_code(exc: urllib.error.HTTPError) -> str:
-    """The provider's machine-readable error code only; its message may echo credentials or course text."""
+    """The provider's error code when it is one we know; its message and any other string stay out of reports."""
     try:
         error = json.loads(exc.read(4000)).get("error") or {}
     except (ValueError, AttributeError, OSError):
-        return "none"
-    return _token(str(error.get("code") or error.get("type") or "none"))
+        return "unreadable"
+    for code in (error.get("code"), error.get("type")):
+        if code in ERROR_CODES:
+            return code
+    return "other"
 
 
-def _token(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]", "", value)[:64] or "none"
+def _request_id(value: str | None) -> str:
+    return value if value and REQUEST_ID.fullmatch(value) else "invalid"
 
 
 def _reference_span(own: list[dict[str, Any]]) -> tuple[float, float] | None:
