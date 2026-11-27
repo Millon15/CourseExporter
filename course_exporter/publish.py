@@ -21,6 +21,8 @@ Runner = Callable[..., subprocess.CompletedProcess]
 GIB = 1 << 30
 LESSON_PAGE = "lesson.html"
 RESERVATIONS = ".reservations"
+RESERVATION_GROWTH = 1.25
+"""A lesson that outgrows its estimate asks for this multiple of what it has written so far."""
 
 
 class PublishError(Exception):
@@ -141,16 +143,37 @@ class SpaceGuard:
 
     def watcher(self, lesson_dir: Path, allowance: int) -> Callable[[], str | None]:
         """The abort check for one lesson's writers: the disk floor, the staging cap, and the lesson's own reservation
-        (temporary and merge files included, since they live in the lesson directory)."""
+        (temporary and merge files included, since they live in the lesson directory). A lesson that outgrows its
+        estimate first asks for a larger reservation and stops only when the shared headroom cannot give it."""
+        limit = allowance
+
         def check() -> str | None:
+            nonlocal limit
             if reason := self.breach():
                 return reason
             if (used := self._used_bytes(self._budget.root)) > self._budget.max_staging:
                 return f"staging holds {used / GIB:.1f} GiB, cap {self._budget.max_staging / GIB:.0f}"
-            if (written := _tree_bytes(lesson_dir)) > allowance:
-                return f"lesson wrote {written / GIB:.2f} GiB, reserved {allowance / GIB:.2f}"
+            if (written := _tree_bytes(lesson_dir)) > limit:
+                grown = int(written * RESERVATION_GROWTH)
+                if reason := self._grow(grown, written):
+                    return f"lesson wrote {written / GIB:.2f} GiB, reserved {limit / GIB:.2f}; {reason}"
+                limit = grown
             return None
         return check
+
+    def _grow(self, size: int, written: int) -> str | None:
+        """Raises this process's reservation to `size` when the bytes still to write fit the shared headroom."""
+        remaining = max(size - written, 0)
+        self._dir.mkdir(parents=True, exist_ok=True)
+        with (self._dir / ".lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            others = self._others()
+            if (free := self._free_bytes(self._budget.root) - others - remaining) < self._budget.min_free:
+                return f"growing it would leave {free / GIB:.1f} GiB free, floor {self._budget.min_free / GIB:.0f}"
+            if (used := self._used_bytes(self._budget.root) + others + remaining) > self._budget.max_staging:
+                return f"growing it would put {used / GIB:.1f} GiB in staging, cap {self._budget.max_staging / GIB:.0f}"
+            (self._dir / f"{self._pid}.json").write_text(json.dumps({"pid": self._pid, "bytes": size}))
+            return None
 
     def _admit(self, size: int) -> str | None:
         with (self._dir / ".lock").open("w") as lock:

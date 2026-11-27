@@ -121,14 +121,24 @@ class SpaceGuardTest(unittest.TestCase):
         self.assertIsNone(self.guard(free=21 * GIB).breach())
         self.assertEqual(self.guard(free=19 * GIB).breach(), "19.0 GiB free, floor 20")
 
-    def test_the_lesson_watcher_stops_at_the_floor_the_cap_or_the_reservation(self):
+    def test_the_lesson_watcher_stops_at_the_floor_the_cap_or_a_reservation_it_cannot_grow(self):
         lesson = self.root / "001-lesson"
         lesson.mkdir()
         (lesson / "v1.mp4.part").write_bytes(b"x" * 2048)
         self.assertIsNone(self.guard(free=30 * GIB, used=GIB).watcher(lesson, 4096)())
-        self.assertIn("reserved", self.guard(free=30 * GIB, used=GIB).watcher(lesson, 1024)())
+        self.assertIn("reserved", self.guard(free=20 * GIB, used=GIB).watcher(lesson, 1024)())
         self.assertIn("cap 5", self.guard(free=30 * GIB, used=6 * GIB).watcher(lesson, 4096)())
         self.assertIn("floor 20", self.guard(free=19 * GIB).watcher(lesson, 4096)())
+
+    def test_a_lesson_over_its_estimate_grows_its_reservation_when_there_is_room(self):
+        lesson = self.root / "001-lesson"
+        lesson.mkdir()
+        (lesson / "v1.mp4.part").write_bytes(b"x" * 2048)
+        check = self.guard(free=30 * GIB, used=GIB, pid=os.getpid()).watcher(lesson, 1024)
+        self.assertIsNone(check(), "30 GiB free leaves room for 512 more bytes above the 20 GiB floor")
+        self.assertIsNone(check(), "the grown reservation covers what is already written")
+        record = (self.root / ".reservations" / f"{os.getpid()}.json").read_text()
+        self.assertIn('"bytes": 2560', record)
 
 
 if __name__ == "__main__":
