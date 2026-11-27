@@ -72,12 +72,21 @@ class StitchTest(unittest.TestCase):
                 joined = stitched([placed(*old)], [placed(*new)])
                 self.assertEqual([s["flags"] for s in joined], [[]])
 
-    def test_pairs_a_phrase_the_later_window_heard_only_in_part(self):
+    def test_pairs_a_phrase_the_later_window_heard_only_in_part_and_flags_the_difference(self):
         kept = [placed(8.0, 14.0, text="один два три"), placed(14.1, 19.0, text="четыре пять")]
         incoming = [placed(10.0, 14.2, text="два три"), placed(14.2, 19.5, text="четыре пять"),
                     placed(19.5, 25.0, text="шесть")]
         self.assertEqual([(s["text"], s["flags"]) for s in sorted(stitched(kept, incoming), key=lambda s: s["start"])],
-                         [("один два три", []), ("четыре пять", []), ("шесть", [])])
+                         [("один два три", ["seam_unresolved"]), ("четыре пять", []), ("шесть", [])])
+
+    def test_does_not_pair_distinct_short_turns_that_do_not_overlap(self):
+        kept = [placed(14.0, 14.4, "S1", "Так")]
+        incoming = [placed(15.4, 15.8, "S2", "Так")]
+        self.assertEqual(pipeline_a._seam_pairs(kept, incoming, WINDOW), [])
+
+    def test_flags_a_pair_whose_words_differ(self):
+        joined = stitched([placed(14.0, 16.0, text="Не піднімай бюджет")], [placed(14.0, 16.0, text="Піднімай бюджет")])
+        self.assertEqual([s["flags"] for s in joined], [["seam_unresolved"]])
 
     def test_keeps_and_flags_an_utterance_only_one_window_heard(self):
         joined = stitched([placed(12.0, 18.0)], [])

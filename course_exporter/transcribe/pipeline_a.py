@@ -1,7 +1,8 @@
 """Pipeline A: `gpt-4o-transcribe-diarize` over 20-minute chunks, stitched into one `uch-segments/1` document.
 
-- Chunks overlap by 10 s. In the overlap, a segment of each chunk with similar words close in time is one
-  utterance heard twice: the pair keeps one copy. Unpaired segments are split at a cut that no segment crosses,
+- Chunks overlap by 10 s. In the overlap, a segment of each chunk with similar words that overlaps it in time is
+  one utterance heard twice: the pair keeps one copy, flagged `seam_unresolved` unless both chunks heard the same
+  words, so a dropped or changed word stays visible. Unpaired segments are split at a cut that no segment crosses,
   nearest the overlap's middle; one the other chunk does not cover at all is kept wherever it falls. A kept
   segment the other chunk contradicts (covers with different words), or kept from one side only past the cut,
   carries the `seam_unresolved` flag for the gate.
@@ -46,7 +47,6 @@ OVERLAP_SECONDS = 10.0
 SEAM_TOLERANCE_SECONDS = 0.3
 SEAM_FLAG = "seam_unresolved"
 PAIR_SIMILARITY = 0.6
-PAIR_DISTANCE_SECONDS = 1.5
 REQUEST_ID = re.compile(r"req_[A-Za-z0-9]{8,64}")
 ERROR_CODES = frozenset({"invalid_api_key", "insufficient_quota", "rate_limit_exceeded", "model_not_found",
                          "invalid_request_error", "server_error", "invalid_value", "unsupported_value",
@@ -209,7 +209,7 @@ def _seam_pairs(kept: list[dict[str, Any]], incoming: list[dict[str, Any]], wind
         return []
     olds = [(i, s) for i, s in enumerate(kept) if s["end"] > window.start]
     news = [(j, s) for j, s in enumerate(incoming) if s["start"] < window.previous_end]
-    scored = sorted(((_similarity(a, b), i, j) for i, a in olds for j, b in news if _close(a, b)), reverse=True)
+    scored = sorted(((_similarity(a, b), i, j) for i, a in olds for j, b in news if _overlaps(a, b)), reverse=True)
     pairs, used_old, used_new = [], set(), set()
     for score, i, j in scored:
         if score >= PAIR_SIMILARITY and i not in used_old and j not in used_new:
@@ -275,8 +275,16 @@ def _stitch(kept: list[dict[str, Any]], incoming: list[dict[str, Any]], pairs: l
               for i, s in enumerate(kept) if i not in paired_old]
     joined += [_seam_side(s, loose_old, cut, before=False) if id(s) in loose else s
                for j, s in enumerate(incoming) if j not in paired_new]
-    joined += [kept[i] if (_middle(kept[i]) + _middle(incoming[j])) / 2 < cut else incoming[j] for i, j in pairs]
+    joined += [_pair_copy(kept[i], incoming[j], cut) for i, j in pairs]
     return [s for s in joined if s is not None]
+
+
+def _pair_copy(old: dict[str, Any], new: dict[str, Any], cut: float) -> dict[str, Any]:
+    """One copy of a paired utterance, from the side its mean midpoint falls on; flagged when the words differ."""
+    copy = old if (_middle(old) + _middle(new)) / 2 < cut else new
+    if _words(old["text"]) == _words(new["text"]):
+        return copy
+    return {**copy, "flags": [*copy["flags"], SEAM_FLAG]}
 
 
 def _seam_side(segment: dict[str, Any], others: list[dict[str, Any]], cut: float,
@@ -301,10 +309,6 @@ def _common_gap(near: list[dict[str, Any]], low: float, high: float) -> float | 
 
 def _similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
     return difflib.SequenceMatcher(None, _words(a["text"]), _words(b["text"])).ratio()
-
-
-def _close(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    return _overlaps(a, b) or abs(_middle(a) - _middle(b)) <= PAIR_DISTANCE_SECONDS
 
 
 def _overlaps(a: dict[str, Any], b: dict[str, Any]) -> bool:
