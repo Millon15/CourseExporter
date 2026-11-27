@@ -56,6 +56,12 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(links.classify(SHEET).canonical, links.classify(SHEET.replace("/edit?usp=sharing", "")).canonical)
 
 
+    def test_a_notion_database_page_counts_as_rendered_by_its_view(self):
+        calendar = links.classify("https://chatter-atom-bdf.notion.site/0123456789abcdef0123456789abcdef?v=01234567")
+        self.assertEqual(calendar.kind, "pdf")
+        self.assertEqual(calendar.ready_selector.split(", "), [".notion-page-content", ".notion-collection-view-body"])
+
+
 class AddMaterialsTest(unittest.TestCase):
     def test_adds_materials_in_document_order_and_links_every_mention(self):
         html = (f"<p>{anchor(NOTION, 'Правки <b>клієнта</b>')}</p><p>{anchor('https://t.me/x', 'chat')}</p>"

@@ -42,7 +42,8 @@ _MAGIC = ((b"%PDF-", ".pdf"), (b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", 
 _OFFICE = ((b"word/document.xml", ".docx"), (b"xl/workbook.xml", ".xlsx"), (b"ppt/presentation.xml", ".pptx"))
 _OFFICE_TYPES = b"[Content_Types].xml"
 """Every Office package carries it; a plain zip that merely holds a word/ folder does not."""
-NOTION_READY = ".notion-page-content"
+NOTION_READY = ".notion-page-content, .notion-collection-view-body"
+"""A plain page renders its blocks into the first; a database page (a calendar, a table) into the second."""
 
 
 @dataclass(frozen=True)

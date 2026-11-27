@@ -314,7 +314,7 @@ class ExporterTest(unittest.TestCase):
         notion_id, sheet_id = (links.asset_id(links.classify(url)) for url in (notion, sheet))
         self.assertEqual({k: p.name for k, p in self.archive.lessons["L1"].items()},
                          {notion_id: f"{notion_id}-Правки.pdf", sheet_id: f"{sheet_id}-Таблиця.mp4"})
-        self.assertEqual(browser.selectors, [".notion-page-content"])
+        self.assertEqual(browser.selectors, [links.NOTION_READY])
         self.assertEqual(provider.resolved, [])
 
     def test_a_page_that_never_shows_its_content_is_a_gap_not_a_file(self):
