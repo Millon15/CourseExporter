@@ -1,9 +1,12 @@
 """Pipeline A: `gpt-4o-transcribe-diarize` over 20-minute chunks, stitched into one `uch-segments/1` document.
 
-- Chunks overlap by 10 s; each segment is kept by the chunk whose half of the overlap holds its midpoint.
+- Chunks overlap by 10 s. Two chunks are stitched at a cut inside the overlap that no segment of either chunk
+  crosses, nearest its middle, so one utterance is kept once; with no such cut the middle is used and the overlap's
+  segments carry the `seam_unresolved` flag for the gate.
 - The model labels speakers per request, so chunk n+1 gets up to four 2-10 s references, cut from earlier chunks'
   own output, named by the video-wide ids they stand for. A label it returns that is not one of those names is a
-  new speaker; more than four speakers before a seam fails the item, since a fifth cannot be carried across.
+  new speaker, unless an earlier speaker had no 2 s reference: then the mapping is ambiguous and the item fails,
+  as does a fifth speaker before a seam, since at most four carry across.
 - Every raw response, request id and timing lands in `workdir` as the run's receipt; the course audio and text
   there stay private to the owner, since other users share the VPS.
 
@@ -16,6 +19,7 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -35,7 +39,8 @@ ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
 PRODUCER_CONFIG = "a-4o-diarize-c20m-o10"
 MAX_CHUNK_SECONDS = 1200.0
 OVERLAP_SECONDS = 10.0
-PLAN_SLACK_SECONDS = 1.0
+SEAM_TOLERANCE_SECONDS = 0.3
+SEAM_FLAG = "seam_unresolved"
 MAX_UPLOAD_BYTES = 24 * 1000 * 1000
 MAX_REFERENCES = 4
 REFERENCE_SECONDS = (2.0, 10.0)
@@ -66,8 +71,7 @@ class Window:
     index: int
     start: float
     end: float
-    keep_from: float
-    keep_until: float
+    previous_end: float
 
 
 @dataclass
@@ -79,17 +83,12 @@ class Receipt:
 
 
 def plan(duration: float, max_seconds: float = MAX_CHUNK_SECONDS, overlap: float = OVERLAP_SECONDS) -> list[Window]:
-    """Windows of at most `max_seconds`, overlapping by `overlap`; the keep bounds split each overlap in half.
-
-    The last window may run `PLAN_SLACK_SECONDS` long, so a probe that reads a few milliseconds past a round length
-    does not open a near-empty window."""
+    """Windows of at most `max_seconds`, each after the first starting `overlap` before the previous one ends."""
     starts = [0.0]
-    while starts[-1] + max_seconds + PLAN_SLACK_SECONDS < duration:
+    while starts[-1] + max_seconds < duration:
         starts.append(starts[-1] + max_seconds - overlap)
-    ends = [start + max_seconds for start in starts[:-1]] + [duration]
-    seams = [start + overlap / 2 for start in starts[1:]]
-    return [Window(i, start, end, seams[i - 1] if i else 0.0, seams[i] if i < len(seams) else duration)
-            for i, (start, end) in enumerate(zip(starts, ends))]
+    ends = [min(start + max_seconds, duration) for start in starts]
+    return [Window(i, start, end, ends[i - 1] if i else 0.0) for i, (start, end) in enumerate(zip(starts, ends))]
 
 
 class Transcriber:
@@ -106,9 +105,9 @@ class Transcriber:
         receipt, kept, voices, known = Receipt(), [], {}, []
         for window in plan(duration, self._max_chunk_seconds):
             response = self._request(clip, window, voices, receipt)
-            labels = _label_map(response["segments"], voices, known)
+            labels = _label_map(response["segments"], voices, known, _unreferenced(kept, voices), window)
             known = list(dict.fromkeys([*known, *labels.values()]))
-            kept.extend(_place(response, window, labels))
+            kept = _stitch(kept, _placed(response, window, labels), window)
             voices = self._references(clip, kept, voices)
         merge_began = time.monotonic()
         document = self._document(clip, duration, _renumbered(kept), receipt)
@@ -142,9 +141,11 @@ class Transcriber:
                     payload = json.load(reply)
                     receipt.request_ids.append(reply.headers.get("x-request-id", ""))
             except urllib.error.HTTPError as exc:
-                receipt.request_ids.append(exc.headers.get("x-request-id", "") if exc.headers else "")
+                request_id = exc.headers.get("x-request-id", "") if exc.headers else ""
+                receipt.request_ids.append(request_id)
                 if exc.code not in RETRY_STATUSES or delay is None:
-                    raise PipelineError(f"OpenAI HTTP {exc.code}: {exc.read(300).decode(errors='replace')}") from None
+                    raise PipelineError(f"OpenAI HTTP {exc.code}, request {_token(request_id)}, "
+                                        f"error code {_error_code(exc)}") from None
                 receipt.retries += 1
                 self._sleep(delay)
                 continue
@@ -183,29 +184,74 @@ class Transcriber:
         (self._workdir / name).write_text(json.dumps(payload, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 
 
-def _label_map(raw_segments: list[dict[str, Any]], voices: dict[str, Path], known: list[str]) -> dict[str, str]:
+def _label_map(raw_segments: list[dict[str, Any]], voices: dict[str, Path], known: list[str],
+               unreferenced: list[str], window: Window) -> dict[str, str]:
     """A reference name maps to itself; any other label becomes the next video-wide id after `known`."""
     labels: dict[str, str] = {}
     for label in dict.fromkeys(raw["speaker"] for raw in raw_segments):
+        if label not in voices and unreferenced:
+            raise PipelineError(f"window {window.index}: label {label!r} may be {', '.join(unreferenced)}, "
+                                "who had no 2 s reference; the speaker mapping is ambiguous")
         fresh = [value for value in labels.values() if value not in voices]
         labels[label] = label if label in voices else f"S{len(known) + len(fresh) + 1}"
     return labels
 
 
-def _place(response: dict[str, Any], window: Window, labels: dict[str, str]) -> list[dict[str, Any]]:
-    """Video-relative segments this window keeps, under their video-wide speaker ids."""
-    placed = []
-    for raw in response["segments"]:
-        start, end = window.start + float(raw["start"]), window.start + float(raw["end"])
-        if window.keep_from <= (start + end) / 2 < window.keep_until and raw["text"].strip():
-            placed.append({"start": round(start, 3), "end": round(end, 3), "speaker": labels[raw["speaker"]],
-                           "text": raw["text"].strip(), "flags": []})
-    return placed
+def _unreferenced(kept: list[dict[str, Any]], voices: dict[str, Path]) -> list[str]:
+    return [speaker for speaker in dict.fromkeys(s["speaker"] for s in kept) if speaker not in voices]
+
+
+def _placed(response: dict[str, Any], window: Window, labels: dict[str, str]) -> list[dict[str, Any]]:
+    """Every non-empty segment of the window, video-relative, under its video-wide speaker id."""
+    return [{"start": round(window.start + float(raw["start"]), 3), "end": round(window.start + float(raw["end"]), 3),
+             "speaker": labels[raw["speaker"]], "text": raw["text"].strip(), "flags": []}
+            for raw in response["segments"] if raw["text"].strip()]
+
+
+def _stitch(kept: list[dict[str, Any]], incoming: list[dict[str, Any]], window: Window) -> list[dict[str, Any]]:
+    """Joins a window to what came before at one cut inside their overlap; see the module docstring."""
+    low, high = window.start, window.previous_end
+    if window.index == 0 or high <= low:
+        return kept + incoming
+    near = [s for s in kept if s["end"] > low] + [s for s in incoming if s["start"] < high]
+    cut = _common_gap(near, low, high)
+    resolved = cut is not None
+    cut = (low + high) / 2 if cut is None else cut
+    joined = [s for s in kept if _middle(s) < cut] + [s for s in incoming if _middle(s) >= cut]
+    if resolved:
+        return joined
+    return [{**s, "flags": [*s["flags"], SEAM_FLAG]} if s["end"] > low and s["start"] < high else s for s in joined]
+
+
+def _common_gap(near: list[dict[str, Any]], low: float, high: float) -> float | None:
+    """The segment edge in [low, high], nearest the middle, that no segment crosses by more than the tolerance."""
+    edges = {low, high, *(t for s in near for t in (s["start"], s["end"]) if low <= t <= high)}
+    middle, tolerance = (low + high) / 2, SEAM_TOLERANCE_SECONDS
+    open_cuts = [t for t in edges if not any(s["start"] + tolerance < t < s["end"] - tolerance for s in near)]
+    return min(open_cuts, key=lambda t: (abs(t - middle), t)) if open_cuts else None
+
+
+def _middle(segment: dict[str, Any]) -> float:
+    return (segment["start"] + segment["end"]) / 2
 
 
 def _renumbered(kept: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    ids = {speaker: f"S{n}" for n, speaker in enumerate(dict.fromkeys(s["speaker"] for s in kept), start=1)}
-    return [{**segment, "speaker": ids[segment["speaker"]]} for segment in sorted(kept, key=lambda s: s["start"])]
+    ordered = sorted(kept, key=lambda s: s["start"])
+    ids = {speaker: f"S{n}" for n, speaker in enumerate(dict.fromkeys(s["speaker"] for s in ordered), start=1)}
+    return [{**segment, "speaker": ids[segment["speaker"]]} for segment in ordered]
+
+
+def _error_code(exc: urllib.error.HTTPError) -> str:
+    """The provider's machine-readable error code only; its message may echo credentials or course text."""
+    try:
+        error = json.loads(exc.read(4000)).get("error") or {}
+    except (ValueError, AttributeError, OSError):
+        return "none"
+    return _token(str(error.get("code") or error.get("type") or "none"))
+
+
+def _token(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "", value)[:64] or "none"
 
 
 def _reference_span(own: list[dict[str, Any]]) -> tuple[float, float] | None:

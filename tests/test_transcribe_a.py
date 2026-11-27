@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import shutil
@@ -35,22 +36,67 @@ def seg(start, end, speaker, text="слово"):
 
 class PlanTest(unittest.TestCase):
     def test_one_window_when_the_audio_fits(self):
-        self.assertEqual(pipeline_a.plan(900.0), [pipeline_a.Window(0, 0.0, 900.0, 0.0, 900.0)])
+        self.assertEqual(pipeline_a.plan(900.0), [pipeline_a.Window(0, 0.0, 900.0, 0.0)])
 
-    def test_windows_overlap_and_split_each_overlap_in_half(self):
-        windows = pipeline_a.plan(2160.0)
-        self.assertEqual([(w.start, w.end, w.keep_from, w.keep_until) for w in windows],
-                         [(0.0, 1200.0, 0.0, 1195.0), (1190.0, 2160.0, 1195.0, 2160.0)])
+    def test_windows_overlap_by_ten_seconds(self):
+        self.assertEqual([(w.start, w.end, w.previous_end) for w in pipeline_a.plan(2160.0)],
+                         [(0.0, 1200.0, 0.0), (1190.0, 2160.0, 1200.0)])
 
-    def test_a_few_milliseconds_past_the_cap_stay_in_the_last_window(self):
-        self.assertEqual([(w.start, w.end) for w in pipeline_a.plan(1200.4)], [(0.0, 1200.4)])
+    def test_no_window_exceeds_the_cap_and_none_is_near_empty(self):
+        for duration in (1200.0, 1200.4, 2390.0, 5000.0):
+            with self.subTest(duration):
+                windows = pipeline_a.plan(duration)
+                self.assertTrue(all(w.end - w.start <= 1200.0 for w in windows))
+                self.assertEqual(windows[-1].end, duration)
+                self.assertTrue(all(w.end - w.start >= 10.0 for w in windows))
 
-    def test_every_instant_is_kept_by_exactly_one_window(self):
-        windows = pipeline_a.plan(5000.0, 1200.0, 10.0)
-        for instant in (0.0, 1194.9, 1195.0, 2385.0, 4999.9):
-            owners = [w for w in windows if w.keep_from <= instant < w.keep_until]
-            self.assertEqual(len(owners), 1, instant)
-            self.assertTrue(owners[0].start <= instant <= owners[0].end)
+
+def placed(start, end, speaker="S1", text="одна фраза"):
+    return {"start": start, "end": end, "speaker": speaker, "text": text, "flags": []}
+
+
+class StitchTest(unittest.TestCase):
+    """Window 1 of `plan(30, 20, 10)`: it starts at 10 and the previous window ends at 20."""
+
+    WINDOW = pipeline_a.Window(1, 10.0, 30.0, 20.0)
+
+    def test_keeps_one_copy_of_an_utterance_whose_timestamps_jitter_across_the_middle(self):
+        for old, new in (((13.0, 16.0), (14.0, 17.0)), ((14.0, 17.0), (13.0, 16.0))):
+            with self.subTest(old=old, new=new):
+                joined = pipeline_a._stitch([placed(*old)], [placed(*new)], self.WINDOW)
+                self.assertEqual(len(joined), 1)
+                self.assertEqual(joined[0]["flags"], [])
+
+    def test_cuts_at_a_gap_both_windows_share(self):
+        kept = [placed(8.0, 14.0, text="a"), placed(14.1, 19.0, text="b")]
+        incoming = [placed(10.0, 14.2, text="a2"), placed(14.2, 19.5, text="b2"), placed(19.5, 25.0, text="c")]
+        self.assertEqual([s["text"] for s in pipeline_a._stitch(kept, incoming, self.WINDOW)], ["a", "b2", "c"])
+
+    def test_flags_the_overlap_when_no_cut_is_free(self):
+        kept = [placed(9.0, 20.5, text="long")]
+        incoming = [placed(10.0, 16.0, text="x"), placed(16.0, 22.0, text="y")]
+        joined = pipeline_a._stitch(kept, incoming, self.WINDOW)
+        self.assertEqual([(s["text"], s["flags"]) for s in joined],
+                         [("long", ["seam_unresolved"]), ("y", ["seam_unresolved"])])
+
+    def test_numbers_speakers_after_sorting_by_start(self):
+        joined = [placed(14.0, 15.0, "S1"), placed(12.0, 19.0, "S2")]
+        self.assertEqual([(s["start"], s["speaker"]) for s in pipeline_a._renumbered(joined)],
+                         [(12.0, "S1"), (14.0, "S2")])
+
+
+class LabelMapTest(unittest.TestCase):
+    WINDOW = pipeline_a.Window(1, 10.0, 30.0, 20.0)
+
+    def test_an_unnamed_label_is_ambiguous_while_a_known_speaker_lacks_a_reference(self):
+        raw = [seg(0.0, 3.0, "A")]
+        with self.assertRaisesRegex(pipeline_a.PipelineError, "ambiguous"):
+            pipeline_a._label_map(raw, {"S1": Path("r.wav")}, ["S1", "S2"], ["S2"], self.WINDOW)
+
+    def test_named_labels_map_to_themselves_and_new_ones_continue_the_count(self):
+        raw = [seg(0.0, 3.0, "S1"), seg(3.0, 6.0, "A"), seg(6.0, 9.0, "B")]
+        labels = pipeline_a._label_map(raw, {"S1": Path("r.wav"), "S2": Path("q.wav")}, ["S1", "S2"], [], self.WINDOW)
+        self.assertEqual(labels, {"S1": "S1", "A": "S3", "B": "S4"})
 
 
 class CostTest(unittest.TestCase):
@@ -77,13 +123,13 @@ class MultipartTest(unittest.TestCase):
 
 @unittest.skipUnless(FFMPEG, "ffmpeg not installed")
 class TranscriberTest(unittest.TestCase):
-    """50 s of audio in 20 s windows with 10 s overlap: windows at 0, 10, 20, 30; seams at 15, 25, 35."""
+    """49.5 s of audio in 20 s windows with 10 s overlap: windows at 0, 10, 20 and 30."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.audio = Path(self.tmp.name) / "clip.opus"
         subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                        "sine=frequency=300:duration=50", "-ac", "1", "-ar", "16000", "-c:a", "libopus",
+                        "sine=frequency=300:duration=49.5", "-ac", "1", "-ar", "16000", "-c:a", "libopus",
                         str(self.audio)], check=True)
         self.requests = []
 
@@ -143,6 +189,14 @@ class TranscriberTest(unittest.TestCase):
         crowd = {"segments": [seg(i * 3.0, i * 3.0 + 2.5, label) for i, label in enumerate("ABCDE")]}
         with self.assertRaisesRegex(pipeline_a.PipelineError, "5 speakers"):
             self.run_clip(self.transcriber(crowd))
+
+    def test_a_provider_error_reports_status_and_code_but_not_its_message(self):
+        body = json.dumps({"error": {"message": f"Incorrect API key {KEY} for «урок»", "code": "invalid_api_key"}})
+        denied = urllib.error.HTTPError(pipeline_a.ENDPOINT, 401, "no", {"x-request-id": "req_9"},
+                                        io.BytesIO(body.encode()))
+        with self.assertRaises(pipeline_a.PipelineError) as caught:
+            self.run_clip(self.transcriber(denied))
+        self.assertEqual(str(caught.exception), "OpenAI HTTP 401, request req_9, error code invalid_api_key")
 
     def test_retries_throttling_then_fails_on_a_permanent_error(self):
         throttled = urllib.error.HTTPError(pipeline_a.ENDPOINT, 429, "slow", Message(), None)

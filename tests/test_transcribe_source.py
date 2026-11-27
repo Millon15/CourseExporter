@@ -9,6 +9,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 from course_exporter.transcribe import source
 from course_exporter.transcribe.catalog import VideoAsset
@@ -60,8 +61,10 @@ class FakeApi:
 
 
 class ResolveTest(unittest.TestCase):
-    def listing(self, *entries):
-        return lambda args, **kw: done(stdout=json.dumps(list(entries)))
+    FOLDERS = [{"Name": "001-урок", "ID": "P"}, {"Name": "002-урок", "ID": "Q"}]
+
+    def listing(self, *entries, folders=FOLDERS):
+        return lambda args, **kw: done(stdout=json.dumps(folders if "--dirs-only" in args else list(entries)))
 
     def entry(self, file_id, name="v.mp4", size=10, md5="AA"):
         return {"Name": name, "Size": size, "Hashes": {"md5": md5}, "ID": file_id}
@@ -82,12 +85,23 @@ class ResolveTest(unittest.TestCase):
         with self.assertRaisesRegex(source.SourceError, "changed"):
             source.resolve(asset(), "gdrive:Courses", api, run=self.listing(self.entry("F1")))
 
-    def test_lists_the_lesson_folder(self):
+    def test_lists_the_course_then_the_lesson_folder(self):
         calls = []
         api = FakeApi(b"", drive_file(size=10, md5="aa"))
-        run = lambda args, **kw: calls.append(args) or done(stdout=json.dumps([self.entry("F1")]))
-        source.resolve(asset(), "gdrive:Courses", api, run=run)
-        self.assertEqual(calls[0][-1], "gdrive:Courses/kwiga-smm/001-урок")
+        listed = self.listing(self.entry("F1"))
+        source.resolve(asset(), "gdrive:Courses", api, run=lambda args, **kw: calls.append(args) or listed(args))
+        self.assertEqual([c[-1] for c in calls], ["gdrive:Courses/kwiga-smm", "gdrive:Courses/kwiga-smm/001-урок"])
+
+    def test_refuses_a_file_whose_parent_is_not_the_lesson_folder(self):
+        api = FakeApi(b"", drive_file(size=10, md5="aa", parents=("other",)))
+        with self.assertRaisesRegex(source.SourceError, "no longer in"):
+            source.resolve(asset(), "gdrive:Courses", api, run=self.listing(self.entry("F1")))
+
+    def test_refuses_a_missing_or_doubled_lesson_folder(self):
+        api = FakeApi(b"", drive_file(size=10, md5="aa"))
+        for folders in ([], [{"Name": "001-урок", "ID": "P"}, {"Name": "001-урок", "ID": "P2"}]):
+            with self.subTest(len(folders)), self.assertRaisesRegex(source.SourceError, "Drive folders named"):
+                source.resolve(asset(), "gdrive:Courses", api, run=self.listing(self.entry("F1"), folders=folders))
 
 
 class TokenTest(unittest.TestCase):
@@ -189,19 +203,53 @@ class AudioCacheTest(unittest.TestCase):
         self.assertTrue(any(r for r in api.ranges if r))
         self.assertAlmostEqual(audio.seconds, 4.0, delta=0.2)
 
-    def test_the_proxy_serves_only_its_secret_path(self):
-        api = FakeApi(b"0123456789", drive_file(b"0123456789"))
-        with source._loopback_proxy(api, "F1") as url:
+    def test_the_proxy_serves_only_its_secret_path_in_bounded_upstream_ranges(self):
+        data = b"0123456789"
+        api = FakeApi(data, drive_file(data))
+        with source._loopback_proxy(api, drive_file(data), window=3) as url:
             base = url.rsplit("/", 2)[0]
             for wrong in (f"{base}/source.mp4", f"{base}/x/source.mp4"):
                 with self.subTest(wrong), self.assertRaises(urllib.error.HTTPError) as caught:
                     urllib.request.urlopen(wrong, timeout=10)
                 self.assertEqual(caught.exception.code, 404)
                 caught.exception.close()
-            request = urllib.request.Request(url, headers={"Range": "bytes=2-4"})
+            request = urllib.request.Request(url, headers={"Range": "bytes=2-"})
             with urllib.request.urlopen(request, timeout=10) as reply:
-                self.assertEqual((reply.status, reply.read()), (206, b"234"))
-        self.assertEqual(api.ranges, ["bytes=2-4"])
+                self.assertEqual((reply.status, reply.headers["Content-Range"], reply.read()),
+                                 (206, "bytes 2-9/10", b"23456789"))
+            with urllib.request.urlopen(url, timeout=10) as reply:
+                self.assertEqual((reply.status, reply.read()), (200, data))
+        self.assertEqual(api.ranges[:3], ["bytes=2-4", "bytes=5-7", "bytes=8-9"])
+        self.assertTrue(all(r and int(r.split("-")[1]) - int(r[6:].split("-")[0]) < 3 for r in api.ranges))
+
+    def test_range_header_spans(self):
+        cases = {None: (0, 9), "bytes=0-": (0, 9), "bytes=3-5": (3, 5), "bytes=8-99": (8, 9), "bytes=-4": (6, 9),
+                 "bytes=10-": None, "bytes=5-3": None, "bytes=0-1,4-5": None, "items=0-1": None, "bytes=x-": None}
+        for header, span in cases.items():
+            with self.subTest(header):
+                self.assertEqual(source._requested_span(header, 10), span)
+
+    def test_the_seekable_read_keeps_the_capability_out_of_ffmpeg_argv(self):
+        data = self.video()
+        api, cache = self.cache(data)
+        launched = []
+        real_popen = subprocess.Popen
+
+        def spy(argv, **kwargs):
+            launched.append(argv)
+            return real_popen(argv, **kwargs)
+
+        with mock.patch.object(source.subprocess, "Popen", spy):
+            cache._transcode_seekable(drive_file(data), Path(self.tmp.name) / "seek.opus")
+        self.assertTrue(any("concat" in argv for argv in launched))
+        self.assertFalse(any("127.0.0.1" in arg for argv in launched for arg in argv))
+
+    def test_a_seekable_read_refuses_a_file_moved_meanwhile(self):
+        data = self.video()
+        api, cache = self.cache(data, parents=("elsewhere",))
+        self.root.mkdir(mode=0o700)
+        with self.assertRaisesRegex(source.SourceError, "changed during the seekable read"):
+            cache._transcode_seekable(drive_file(data), self.root / "seek.opus")
 
     def test_discards_audio_whose_stream_differs_from_the_pinned_md5(self):
         data = self.video("-movflags", "+faststart")
