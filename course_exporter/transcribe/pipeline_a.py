@@ -4,7 +4,8 @@
 - The model labels speakers per request, so chunk n+1 gets up to four 2-10 s references, cut from earlier chunks'
   own output, named by the video-wide ids they stand for. A label it returns that is not one of those names is a
   new speaker; more than four speakers before a seam fails the item, since a fifth cannot be carried across.
-- Every raw response, request id and timing lands in `workdir` as the run's receipt.
+- Every raw response, request id and timing lands in `workdir` as the run's receipt; the course audio and text
+  there stay private to the owner, since other users share the VPS.
 
 The OpenAI key is read from the gateway's environment, never from argv, and is never written anywhere.
 """
@@ -99,7 +100,8 @@ class Transcriber:
 
     def transcribe(self, clip: Clip) -> dict[str, Any]:
         began = time.monotonic()
-        self._workdir.mkdir(parents=True, exist_ok=True)
+        self._workdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._workdir.chmod(0o700)
         duration = _duration(self._ffmpeg, clip.audio)
         receipt, kept, voices, known = Receipt(), [], {}, []
         for window in plan(duration, self._max_chunk_seconds):

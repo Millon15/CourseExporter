@@ -136,6 +136,7 @@ class TranscriberTest(unittest.TestCase):
         self.assertIn(b"data:audio/wav;base64,", second)
         self.assertEqual(self.requests[0].get_header("Authorization"), f"Bearer {KEY}")
         work = Path(self.tmp.name) / "work"
+        self.assertEqual(oct(work.stat().st_mode & 0o777), "0o700")
         self.assertFalse(any(KEY.encode() in p.read_bytes() for p in work.iterdir()))
 
     def test_a_fifth_speaker_before_a_seam_fails_the_item(self):
