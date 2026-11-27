@@ -152,6 +152,41 @@ class GetCourseTests(unittest.TestCase):
         media = self.provider.resolve(browser, self.ref, lesson.assets[2])
         self.assertEqual((media.kind, media.url), ("file", attachment))
 
+    def test_outside_links_survive_without_shifting_asset_ids(self):
+        reading = "https://docs.google.com/document/d/example/edit"
+        file_url = "https://cdn.example.test/fileservice/file/guide?sig=placeholder"
+
+        def projection(script):
+            self.assertNotIn("removeAttribute('href')", script)
+            self.assertNotIn("(external link)", script)
+            return {
+                "html": '<video src="asset:video-1"></video>'
+                        f'<a href="{reading}">Reading</a>'
+                        '<img src="asset:image-1" alt="Slide">'
+                        '<a href="/lessons/20">Next lesson</a>'
+                        '<a href="asset:file-1">Guide</a>'
+                        '<video src="asset:video-direct-1"></video>'
+                        '<a href="asset:file-2">Workbook</a>',
+                "frames": [{"url": PLAYER}],
+                "videos": [{"title": "Direct video", "sources": []}],
+                "assets": [
+                    {"kind": "image", "title": "Slide", "url": "https://cdn.example.test/slide.png"},
+                    {"kind": "file", "title": "Guide", "url": file_url},
+                    {"kind": "file", "title": "Workbook", "url": "https://cdn.example.test/download"},
+                ],
+            }
+
+        browser = FixtureBrowser({LESSON: projection})
+        lesson = self.provider.extract(browser, self.ref)
+        self.assertEqual([asset.asset_id for asset in lesson.assets],
+                         ["video-1", "video-direct-1", "image-1", "file-1", "file-2"])
+        self.assertIn(f'<a href="{reading}" rel="noreferrer">Reading</a>', lesson.html)
+        self.assertIn('<span>Next lesson</span>', lesson.html)
+        self.assertIn('<a href="asset:file-1">Guide</a>', lesson.html)
+        self.assertNotIn(file_url, lesson.html)
+        media = self.provider.resolve(browser, self.ref, lesson.assets[3])
+        self.assertEqual((media.kind, media.url), ("file", file_url))
+
     def test_gated_lesson_has_no_assets(self):
         browser = FixtureBrowser({LESSON: {"gated": True, "frames": [{"url": PLAYER}]}})
         lesson = self.provider.extract(browser, self.ref)

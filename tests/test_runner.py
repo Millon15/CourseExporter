@@ -2,8 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from course_exporter import media
-from course_exporter.model import Asset, Lesson, LessonRef, Media, UnsupportedMedia
+from course_exporter import links, media
+from course_exporter.model import Asset, Lesson, LessonRef, Media, PageNotReady, UnsupportedMedia
 from contextlib import contextmanager
 
 from course_exporter.publish import AdmissionTimeout, BudgetError, PublishError
@@ -257,6 +257,114 @@ class ExporterTest(unittest.TestCase):
         self.exporter(provider, space=space).run(self.options())
         self.exporter(provider, space=space).run(self.options())
         self.assertEqual(len(space.sizes), 1, "the gated lesson and the rerun reserve nothing")
+
+
+    def published_course(self, *assets, html=""):
+        provider = self.course(Lesson(ref(1), "available", html, assets))
+        publisher = FakePublisher()
+        self.exporter(provider, publisher=publisher).run(self.options())
+        for path in self.out.glob("L1/*"):
+            path.rename(self.out / f"drive-{path.name}")
+        return provider, publisher
+
+    def test_refresh_pages_reextracts_a_published_lesson_without_fetching_what_drive_holds(self):
+        provider, publisher = self.published_course(video("v1"))
+        provider.lessons["L1"] = Lesson(ref(1), "available", "<p>new text</p>", (video("v1"), video("v2")))
+        summary = self.exporter(provider, publisher=publisher).run(self.options(refresh_pages=True))
+        self.assertEqual(self.fetched, ["v1", "v2"])
+        self.assertEqual(sorted(self.archive.lessons["L1"]), ["v1", "v2"])
+        self.assertEqual(self.archive.lessons["L1"]["v1"].name, "v1-v1.mp4")
+        self.assertEqual([f.path.name for f in publisher.files["L1"]], ["v1-v1.mp4", "v2-v2.mp4"])
+        self.assertEqual(summary.lessons, {"published": 1})
+
+    def test_without_refresh_pages_a_published_lesson_is_left_alone(self):
+        provider, publisher = self.published_course(video("v1"))
+        self.exporter(provider, publisher=publisher).run(self.options())
+        self.assertEqual(publisher.lessons, ["L1"])
+
+    def test_a_staged_file_that_vanished_before_publishing_is_fetched_again(self):
+        provider = self.course(Lesson(ref(1), "available", "", (video("v1"),)))
+        self.exporter(provider).run(self.options())
+        (self.out / "L1" / "v1-v1.mp4").rename(self.out / "gone.mp4")
+        self.state.set_lesson("L1", "partial")
+        self.exporter(provider).run(self.options())
+        self.assertEqual(self.fetched, ["v1", "v1"])
+
+    def test_linked_materials_are_saved_beside_the_lesson(self):
+        notion = "https://w.notion.site/Page-0123456789abcdef0123456789abcdef"
+        sheet = "https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123/edit"
+        html = (f'<a href="{notion}" rel="noreferrer">Правки</a> <a href="{sheet}" rel="noreferrer">Таблиця</a>'
+                '<a href="https://t.me/x" rel="noreferrer">chat</a>')
+        provider = self.course(Lesson(ref(1), "available", html, ()))
+        browser = FakeBrowser()
+        sources = []
+        fetch = self.fetch
+
+        def fetch_file(source, asset, stem, max_height, abort=None):
+            sources.append((source.kind, source.url))
+            return fetch(source, asset, stem, max_height, abort)
+
+        exporter = Exporter(provider, browser=browser, state=self.state, archive=self.archive, fetch=fetch_file,
+                            check=self.check, log=self.logs.append)
+        summary = exporter.run(self.options())
+        self.assertTrue(summary.complete)
+        self.assertEqual(browser.printed, [notion])
+        self.assertEqual(sources, [("file", "https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123"
+                                            "/export?format=xlsx")])
+        notion_id, sheet_id = (links.asset_id(links.classify(url)) for url in (notion, sheet))
+        self.assertEqual({k: p.name for k, p in self.archive.lessons["L1"].items()},
+                         {notion_id: f"{notion_id}-Правки.pdf", sheet_id: f"{sheet_id}-Таблиця.mp4"})
+        self.assertEqual(browser.selectors, [".notion-page-content"])
+        self.assertEqual(provider.resolved, [])
+
+    def test_a_page_that_never_shows_its_content_is_a_gap_not_a_file(self):
+        notion = "https://w.notion.site/Page-0123456789abcdef0123456789abcdef"
+        provider = self.course(Lesson(ref(1), "available", f'<a href="{notion}" rel="noreferrer">x</a>', ()))
+        exporter = Exporter(provider, browser=FakeBrowser(ready=False), state=self.state, archive=self.archive,
+                            fetch=self.fetch, check=self.check, log=self.logs.append)
+        summary = exporter.run(self.options())
+        self.assertEqual((summary.gaps, summary.assets), (1, {"unsupported": 1}))
+        self.assertFalse((self.out / "L1").exists() and any((self.out / "L1").glob("*.pdf")))
+
+    def test_refresh_pages_also_reextracts_a_done_lesson_without_a_publisher(self):
+        provider = self.course(Lesson(ref(1), "available", "<p>old</p>", ()))
+        self.exporter(provider).run(self.options())
+        provider.lessons["L1"] = Lesson(ref(1), "available", "<p>new</p>", (video("v1"),))
+        self.exporter(provider).run(self.options(refresh_pages=True))
+        self.assertEqual(self.fetched, ["v1"])
+        provider.broken.add("L1")
+        summary = self.exporter(provider).run(self.options(refresh_pages=True))
+        self.assertEqual(summary.lessons, {"failed": 1})
+
+    def test_a_material_host_answering_with_a_web_page_is_unsupported_and_set_aside(self):
+        sheet = "https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123/edit"
+        provider = self.course(Lesson(ref(1), "available", f'<a href="{sheet}" rel="noreferrer">x</a>', ()))
+
+        def sign_in_page(source, asset, stem, max_height, abort=None):
+            path = stem.with_name(stem.name + ".xlsx")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"<!DOCTYPE html><title>Sign in</title>")
+            return path
+
+        exporter = Exporter(provider, browser=FakeBrowser(), state=self.state, archive=self.archive,
+                            fetch=sign_in_page, check=self.check, log=self.logs.append)
+        summary = exporter.run(self.options())
+        self.assertEqual(summary.gaps, 1)
+        sheet_id = links.asset_id(links.classify(sheet))
+        self.assertEqual(self.state.asset_status("L1", sheet_id), "unsupported")
+        self.assertEqual([p.name for p in (self.out / "L1").iterdir()], [f"{sheet_id}-x.xlsx.rejected"])
+
+
+class FakeBrowser:
+    def __init__(self, ready=True) -> None:
+        self.ready, self.printed, self.selectors = ready, [], []
+
+    def pdf(self, url, ready_selector="", timeout_s=60):
+        self.selectors.append(ready_selector)
+        if not self.ready:
+            raise PageNotReady("page did not render within 60s")
+        self.printed.append(url)
+        return b"%PDF-1.7 page"
 
 
 class FakePublisher:

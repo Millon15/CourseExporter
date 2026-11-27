@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS assets (
   updated_at TEXT NOT NULL, PRIMARY KEY (lesson_id, asset_id)
 );
 """
+MIGRATIONS = (
+    ("lessons", "published", "ALTER TABLE lessons ADD COLUMN published INTEGER NOT NULL DEFAULT 0;"
+                             " UPDATE lessons SET published = 1 WHERE status = 'published';"),
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +71,7 @@ class CourseState:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(path)
         self._db.executescript(SCHEMA)
+        self._migrate()
 
     def close(self) -> None:
         self._db.close()
@@ -90,9 +95,16 @@ class CourseState:
     def set_lesson(self, lesson_id: str, status: LessonStatus, detail: str = "") -> None:
         with self._db:
             self._db.execute(
-                "UPDATE lessons SET status = ?, detail = ?, updated_at = ? WHERE lesson_id = ?",
-                (status, detail, _now(), lesson_id),
+                "UPDATE lessons SET status = ?, detail = ?, updated_at = ?, published = published OR ?"
+                " WHERE lesson_id = ?",
+                (status, detail, _now(), status == "published", lesson_id),
             )
+
+    def was_published(self, lesson_id: str) -> bool:
+        """True once the lesson reached Drive: its verified files live there even after a later re-extract fails, so
+        a staged file that is gone counts as uploaded, not lost."""
+        row = self._db.execute("SELECT published FROM lessons WHERE lesson_id = ?", (lesson_id,)).fetchone()
+        return bool(row and row[0])
 
     def asset_status(self, lesson_id: str, asset_id: str) -> AssetStatus | None:
         row = self._db.execute(
@@ -120,6 +132,18 @@ class CourseState:
     def mark_asset(self, lesson_id: str, asset: Asset, status: AssetStatus, detail: str) -> None:
         self._upsert_asset(lesson_id, asset, status, "", 0, "", 0.0, detail, "")
 
+    def record_file(self, lesson_id: str, asset_id: str, file: VerifiedFile) -> None:
+        """Marks an asset the exporter already knows as verified with a file obtained outside it (fetched by hand in
+        the owner's browser); raises KeyError for an asset the state has never seen."""
+        with self._db:
+            updated = self._db.execute(
+                "UPDATE assets SET status = 'verified', path = ?, bytes = ?, sha256 = ?, md5 = ?, duration = 0,"
+                " detail = 'recorded by hand', updated_at = ? WHERE lesson_id = ? AND asset_id = ?",
+                (str(file.path), file.bytes, file.sha256, file.md5, _now(), lesson_id, asset_id),
+            ).rowcount
+        if not updated:
+            raise KeyError(f"no asset {asset_id} in lesson {lesson_id}")
+
     def assets(self) -> list[AssetRecord]:
         rows = self._db.execute(
             "SELECT a.lesson_id, a.asset_id, a.kind, a.title, a.status, a.path, a.detail FROM assets a"
@@ -131,6 +155,13 @@ class CourseState:
         lessons = dict(self._db.execute("SELECT status, COUNT(*) FROM lessons GROUP BY status").fetchall())
         assets = dict(self._db.execute("SELECT status, COUNT(*) FROM assets GROUP BY status").fetchall())
         return {"lessons": lessons, "assets": assets}
+
+    def _migrate(self) -> None:
+        for table, column, script in MIGRATIONS:
+            columns = {row[1] for row in self._db.execute(f"PRAGMA table_info({table})")}
+            if column not in columns:
+                with self._db:
+                    self._db.executescript(script)
 
     def _upsert_asset(self, lesson_id: str, asset: Asset, status: AssetStatus, path: str, size: int, sha256: str,
                       duration: float, detail: str, md5: str) -> None:

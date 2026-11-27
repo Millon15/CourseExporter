@@ -45,7 +45,7 @@ class ArchiveTests(unittest.TestCase):
         outside.touch()
         symlink = directory / "linked.pdf"
         symlink.symlink_to(outside)
-        files = {"file-1": symlink, "image-1": directory / "not-on-disk.png"}
+        files = {"file-1": symlink}
         assets = (Asset("video-1", "video", "Clip", "video-1"),)
         html = '<a href="asset:file-1">Guide</a><img src="asset:image-1" alt="Slide">'
 
@@ -56,21 +56,44 @@ class ArchiveTests(unittest.TestCase):
         self.assertNotIn("outside.pdf", rendered)
         self.assertNotIn("linked.pdf", rendered)
 
-    def test_lesson_html_excludes_active_content_and_external_urls(self):
+    def test_verified_drive_only_assets_link_without_a_local_file(self):
+        directory = lesson_dir(self.out, self.ref)
+        files = {"link-1": directory / "Reading copy.pdf", "image-1": directory / "Slide.png"}
+        html = '<a href="asset:link-1">saved copy</a><img src="asset:image-1" alt="Slide">'
+
+        rendered = write_lesson(self.out, Lesson(self.ref, "available", html), files).read_text(encoding="utf-8")
+        self.assertIn('<a href="Reading%20copy.pdf" download>saved copy</a>', rendered)
+        self.assertIn('<img src="Slide.png" alt="Slide">', rendered)
+        self.assertTrue(all(not path.exists() for path in files.values()))
+
+    def test_lesson_html_keeps_outside_anchors_and_excludes_active_content(self):
         raw = """<h2>Title</h2><p onclick="x()">Text &amp; more</p>
             <script>code()</script><form><div>Other person's reply</div><input></form>
             <iframe src="https://outside.example"></iframe><svg><text>Hidden</text></svg>
             <a href="javascript:bad()">Navigation label</a>
-            <a href="https://outside.example?sig=placeholder">Reading</a>
+            <a href="https://outside.example/?v=a&amp;b=&quot;quote&quot;" target="_blank">Reading</a>
+            <a href="//outside.example/handout">Handout</a>
+            <a href="http://outside.example/index">Index</a>
+            <a href="/lessons/20">Relative</a>
+            <a href="mailto:owner@example.test">Email</a>
+            <a href="https:///no-host">Invalid URL</a>
             <img src="https://outside.example/img" srcset="https://outside.example/2x" alt="Remote slide">
             <a href="asset:file-1">Local &lt;file&gt;</a>"""
         clean = sanitize_html(raw)
         self.assertEqual(clean, sanitize_html(clean))
-        for expected in ("<h2>Title</h2>", "<p>Text &amp; more</p>", "Navigation label", "Reading (external link)",
-                         "Remote slide", '<a href="asset:file-1">Local &lt;file&gt;</a>'):
+        rendered = write_lesson(self.out, Lesson(self.ref, "available", clean), {}).read_text(encoding="utf-8")
+        for expected in ('<a href="https://outside.example/?v=a&amp;b=&quot;quote&quot;" rel="noreferrer">Reading</a>',
+                         '<a href="https://outside.example/handout" rel="noreferrer">Handout</a>',
+                         '<a href="http://outside.example/index" rel="noreferrer">Index</a>',
+                         "<h2>Title</h2>", "<p>Text &amp; more</p>", "<span>Navigation label</span>",
+                         "<span>Relative</span>", "<span>Email</span>", "<span>Invalid URL</span>", "Remote slide"):
             self.assertIn(expected, clean)
-        for forbidden in ("script", "iframe", "onclick", "bad()", "outside.example", "Other person", "Hidden"):
+            self.assertIn(expected, rendered)
+        self.assertIn('<a href="asset:file-1">Local &lt;file&gt;</a>', clean)
+        for forbidden in ("script", "iframe", "onclick", "bad()", "Other person", "Hidden", "(external link)",
+                          "outside.example/img", "target="):
             self.assertNotIn(forbidden, clean)
+            self.assertNotIn(forbidden, rendered)
 
     def test_index_includes_gated_and_undownloaded_lessons(self):
         first = LessonRef("getcourse", "1", "19", (1,), "Earlier", "")

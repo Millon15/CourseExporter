@@ -162,9 +162,6 @@ _LESSON = r"""(page, absolute) => {
                 if (url && attachment) {
                     const asset = add('file', url, element.textContent.trim() || element.download || 'Attachment');
                     element.setAttribute('href', 'asset:' + asset.id);
-                } else {
-                    element.removeAttribute('href');
-                    if (url) element.append(' (external link)');
                 }
             }
         }

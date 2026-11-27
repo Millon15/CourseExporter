@@ -15,6 +15,8 @@ from ..model import Asset, AssetKind, Browser, BrowserError, Lesson, LessonRef, 
 
 _COURSE_PATH = re.compile(r"/courses/([A-Za-z0-9_-]+)/?\Z")
 _LESSON_SLUG = re.compile(r"[A-Za-z0-9_-]+\Z")
+_QUIZ_ASSET = re.compile(r"quiz-([A-Za-z0-9_-]+)-([1-9][0-9]*)\Z")
+_QUIZ_READY = ".practice-question .practice-question-description"
 _HLS_MIMES = {"application/vnd.apple.mpegurl", "application/x-mpegurl"}
 
 _FETCH_PAGE = r"""(async (url, project, fileId) => {
@@ -68,11 +70,11 @@ _LESSON = r"""(page, _baseUrl, fileId) => {
     if (available === false) return {available};
     const units = dto.section?.info_units;
     if (!Array.isArray(units)) return {invalidDTO: true};
-    const supported = unit => unit && (unit.type_id === 2 || unit.type_id === 3);
+    const hasFiles = unit => unit && [2, 3, 4].includes(unit.type_id);
     const activeFiles = unit => Array.isArray(unit.files)
         ? unit.files.filter(file => file && !file.is_deleted) : [];
     if (fileId !== null) {
-        for (const unit of units.filter(supported)) {
+        for (const unit of units.filter(hasFiles)) {
             const file = activeFiles(unit).find(item => String(item.id) === fileId);
             if (file) {
                 const drm = [dto, unit, file].some(item => item.drm || item.is_drm || item.encrypted || item.is_encrypted);
@@ -86,11 +88,16 @@ _LESSON = r"""(page, _baseUrl, fileId) => {
         has_only_one_section: dto.has_only_one_section,
         section: {
             info_units: units.map(unit => {
-                if (!supported(unit)) {
+                if (unit?.type_id === 5) {
+                    const quizzes = Array.isArray(unit.quizzes) ? unit.quizzes.filter(Boolean) : [];
+                    return {type_id: 5, quizzes: quizzes.map(({link, name}) => ({link, name}))};
+                }
+                if (!hasFiles(unit)) {
                     return {type_id: Number.isSafeInteger(unit?.type_id) ? unit.type_id : null};
                 }
                 return {
                     type_id: unit.type_id,
+                    title: unit.type_id === 4 ? unit.title : null,
                     description_formatted: unit.type_id === 3 ? unit.description_formatted : null,
                     description: unit.type_id === 3 ? unit.description : null,
                     files: activeFiles(unit).map(({id, mime_type, name, original_name, duration}) => ({
@@ -100,6 +107,34 @@ _LESSON = r"""(page, _baseUrl, fileId) => {
             }),
         },
     };
+}"""
+
+
+_QUIZ = r"""(selector, quizId) => {
+    const images = [];
+    const questions = [...document.querySelectorAll(selector)].map(description => {
+        const copy = description.cloneNode(true);
+        const originals = [...description.querySelectorAll('img')];
+        const copies = [...copy.querySelectorAll('img')];
+        copy.querySelectorAll('form, script, style, iframe, template, noscript, object, svg, math')
+            .forEach(element => element.remove());
+        for (const [index, image] of copies.entries()) {
+            if (!copy.contains(image)) continue;
+            const source = image.getAttribute('data-src') || originals[index].currentSrc || image.getAttribute('src');
+            if (!source) continue;
+            let url;
+            try {
+                url = new URL(source, document.baseURI);
+            } catch {
+                continue;
+            }
+            if (url.protocol !== 'https:' || url.username || url.password) continue;
+            images.push({url: url.href, title: image.alt});
+            image.setAttribute('src', `asset:quiz-${quizId}-${images.length}`);
+        }
+        return copy.innerHTML;
+    });
+    return {questions, images};
 }"""
 
 
@@ -169,6 +204,58 @@ def _placeholder(asset: Asset) -> str:
     return f'<p><a href="{src}">{title}</a></p>'
 
 
+def _quiz_root(lesson_url: str) -> str:
+    parts = urlsplit(lesson_url)
+    return parts._replace(path=parts.path.rstrip("/") + "/quizzes/", query="", fragment="").geturl()
+
+
+def _quiz_id(lesson_url: str, link: Any) -> str:
+    if not isinstance(link, str):
+        raise BrowserError("Kwiga quiz link is unavailable")
+    try:
+        url = _https_url(urljoin(lesson_url, link))
+    except ValueError:
+        url = None
+    root = _quiz_root(lesson_url)
+    if url and url.startswith(root):
+        quiz_id = url.removeprefix(root).partition("?")[0].rstrip("/")
+        if _LESSON_SLUG.fullmatch(quiz_id):
+            return quiz_id
+    raise BrowserError("Kwiga quiz link is outside the lesson or invalid")
+
+
+def _quiz_page(browser: Browser, lesson_url: str, quiz_id: str) -> dict[str, Any]:
+    script = f"({_QUIZ})({json.dumps(_QUIZ_READY)}, {json.dumps(quiz_id)})"
+    page = browser.render(_quiz_root(lesson_url) + quiz_id, script, _QUIZ_READY)
+    if not isinstance(page, dict) or not isinstance(page.get("questions"), list) or not page["questions"]:
+        raise BrowserError("Kwiga quiz returned no task descriptions")
+    return page
+
+
+def _quiz_content(browser: Browser, lesson_url: str, quiz: dict[str, Any]) -> tuple[list[str], list[Asset]]:
+    quiz_id = _quiz_id(lesson_url, quiz.get("link"))
+    page = _quiz_page(browser, lesson_url, quiz_id)
+    name = _text(quiz.get("name")) or f"Quiz {quiz_id}"
+    content = [f"<h3>{escape(name)}</h3>", *(_text(question) for question in page["questions"])]
+    assets = []
+    for index, image in enumerate(_rows(page.get("images")), 1):
+        asset_id = f"quiz-{quiz_id}-{index}"
+        title = _text(image.get("title")) or f"Quiz image {index}"
+        assets.append(Asset(asset_id, "image", title, asset_id))
+    return content, assets
+
+
+def _unit_description(unit: dict[str, Any]) -> str:
+    if unit["type_id"] == 4 and (title := _text(unit.get("title"))):
+        return f"<h3>{escape(title)}</h3>"
+    if unit["type_id"] == 3:
+        if formatted := _text(unit.get("description_formatted")):
+            return formatted
+        if description := _text(unit.get("description")):
+            return f"<p>{escape(description)}</p>"
+    return ""
+
+
 class KwigaProvider:
     name = "kwiga"
 
@@ -235,15 +322,18 @@ class KwigaProvider:
         assets: dict[str, Asset] = {}
         for unit in _rows(section["info_units"]):
             unit_type = unit.get("type_id")
-            if unit_type not in (2, 3):
+            if unit_type == 5:
+                for quiz in _rows(unit.get("quizzes")):
+                    questions, images = _quiz_content(browser, ref.url, quiz)
+                    content.extend(questions)
+                    assets.update((image.asset_id, image) for image in images)
+                continue
+            if unit_type not in (2, 3, 4):
                 label = unit_type if type(unit_type) is int else "unknown"
                 content.append(f"<p>Kwiga info unit type {label} was not exported.</p>")
                 continue
-            if unit_type == 3:
-                if formatted := _text(unit.get("description_formatted")):
-                    content.append(formatted)
-                elif description := _text(unit.get("description")):
-                    content.append(f"<p>{escape(description)}</p>")
+            if description := _unit_description(unit):
+                content.append(description)
             for row in _rows(unit.get("files")):
                 asset = _asset(row)
                 if asset is not None and asset.asset_id not in assets:
@@ -254,6 +344,8 @@ class KwigaProvider:
         return Lesson(ref, "available", sanitize_html("\n".join(content)), tuple(assets.values()))
 
     def resolve(self, browser: Browser, ref: LessonRef, asset: Asset) -> Media:
+        if quiz_asset := _QUIZ_ASSET.fullmatch(asset.ref):
+            return self._resolve_quiz_image(browser, ref, quiz_asset)
         page = _read(browser, ref.url, _LESSON, asset.ref)
         if page.get("available") is False:
             raise UnsupportedMedia("Kwiga lesson is gated")
@@ -267,3 +359,13 @@ class KwigaProvider:
             raise UnsupportedMedia("Kwiga file URL is unavailable")
         origin = urlsplit(ref.url).netloc
         return Media("hls" if asset.kind == "video" else "file", url, {"Referer": f"https://{origin}/"})
+
+    def _resolve_quiz_image(self, browser: Browser, ref: LessonRef, asset: re.Match[str]) -> Media:
+        quiz_id, index = asset.groups()
+        page = _quiz_page(browser, ref.url, quiz_id)
+        images = _rows(page.get("images"))
+        position = int(index) - 1
+        if position >= len(images) or not (url := _https_url(images[position].get("url"))):
+            raise UnsupportedMedia("Kwiga quiz image URL is unavailable")
+        origin = urlsplit(ref.url).netloc
+        return Media("file", url, {"Referer": f"https://{origin}/"})

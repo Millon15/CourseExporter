@@ -1,4 +1,4 @@
-"""Command line: `python3 -m course_exporter export|status`, one process per course output directory."""
+"""Command line: `python3 -m course_exporter export|status|record`, one process per course output directory."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from . import archive, config
 from .browser import OpenClawBrowser
 from .publish import GIB, DrivePublisher, SpaceBudget, SpaceGuard
 from .runner import Exporter, ExportOptions
-from .state import CourseState
+from .state import CourseState, VerifiedFile
 
 PROVIDERS = {
     "kwiga": ("course_exporter.providers.kwiga", "KwigaProvider"),
@@ -50,6 +50,8 @@ def _parser(settings: config.Settings) -> argparse.ArgumentParser:
                         help="stop after the first verified video (pilot); without --limit it reads at most 5 lessons")
     export.add_argument("--rediscover", action="store_true", help="read the course tree again")
     export.add_argument("--decode", action="store_true", help="fully decode every video while verifying")
+    export.add_argument("--refresh-pages", action="store_true",
+                        help="re-extract published lessons; files already on Drive are linked, not fetched again")
     export.add_argument("--name", help="course folder name on Drive; with drive_remote set it is <drive_remote>/<name>")
     export.add_argument("--drive", help="full rclone remote path; overrides drive_remote/<name>")
     export.add_argument("--staging-root", type=Path, default=_path(settings.staging_root),
@@ -61,6 +63,16 @@ def _parser(settings: config.Settings) -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="lesson and asset counts of an output directory")
     status.add_argument("--out", required=True, type=Path)
     status.set_defaults(command=_status)
+    record = commands.add_parser("record", help="mark a known asset verified with a file fetched outside the exporter "
+                                                "and already placed in the lesson's Drive folder")
+    record.add_argument("--out", required=True, type=Path)
+    record.add_argument("--lesson", required=True, help="lesson id")
+    record.add_argument("--asset", required=True, help="asset id")
+    record.add_argument("--name", required=True, help="file name inside the lesson folder")
+    record.add_argument("--bytes", required=True, type=int)
+    record.add_argument("--md5", required=True)
+    record.add_argument("--sha256", default="")
+    record.set_defaults(command=_record)
     return parser
 
 
@@ -84,7 +96,8 @@ def _export(args: argparse.Namespace) -> int:
             summary = exporter.run(ExportOptions(
                 course_url=args.course, out=args.out, max_height=args.max_height,
                 limit=args.limit if args.limit is not None or not args.first_video else PILOT_LESSON_LIMIT,
-                stop_after_videos=1 if args.first_video else None, rediscover=args.rediscover, decode=args.decode))
+                stop_after_videos=1 if args.first_video else None, rediscover=args.rediscover, decode=args.decode,
+                refresh_pages=args.refresh_pages))
         finally:
             browser.close()
             state.close()
@@ -104,6 +117,30 @@ def _status(args: argparse.Namespace) -> int:
                 print(f"{record.status}\t{record.lesson_id}\t{record.asset_id}\t{record.detail}")
     finally:
         state.close()
+    return 0
+
+
+def _record(args: argparse.Namespace) -> int:
+    if "/" in args.name or args.name in ("", ".", ".."):
+        print("--name must be a plain file name", file=sys.stderr)
+        return EXIT_USAGE
+    with _exclusive(args.out / LOCK_FILE) as acquired:
+        if not acquired:
+            print(f"another export holds {args.out / LOCK_FILE}", file=sys.stderr)
+            return EXIT_BUSY
+        state = CourseState(args.out / STATE_FILE)
+        try:
+            refs = {ref.lesson_id: ref for ref, _ in state.lessons()}
+            if args.lesson not in refs:
+                print(f"no lesson {args.lesson} in {args.out}", file=sys.stderr)
+                return EXIT_USAGE
+            path = archive.lesson_dir(args.out, refs[args.lesson]) / args.name
+            state.record_file(args.lesson, args.asset, VerifiedFile(path, args.bytes, args.sha256, md5=args.md5.lower()))
+        except KeyError as error:
+            print(error.args[0], file=sys.stderr)
+            return EXIT_USAGE
+        finally:
+            state.close()
     return 0
 
 

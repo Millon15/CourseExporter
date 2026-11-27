@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 from tempfile import NamedTemporaryFile
 import unicodedata
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from .model import Lesson, LessonRef
 
@@ -28,6 +28,17 @@ _ASSET_LINK = re.compile(r"asset:([A-Za-z0-9_.-]+)\Z")
 def _asset_id(value: str) -> str | None:
     match = _ASSET_LINK.fullmatch(value)
     return match[1] if match else None
+
+
+def _outside_url(href: str) -> str | None:
+    if href.startswith("//"):
+        href = f"https:{href}"
+    if not href.lower().startswith(("http://", "https://")) or re.search(r"[\s\\\x00-\x1f\x7f]", href):
+        return None
+    try:
+        return href if urlsplit(href).hostname else None
+    except ValueError:
+        return None
 
 
 def _missing(asset_id: str, title: str) -> str:
@@ -75,11 +86,11 @@ class _LessonHTML(HTMLParser):
                 else:
                     opening = f'<span class="missing" data-asset="asset:{asset_id}">'
                     closing = " (missing)</span>"
+            elif outside_url := _outside_url(href):
+                opening = f'<a href="{escape(outside_url)}" rel="noreferrer">'
             else:
                 opening = "<span>"
                 closing = "</span>"
-                if href.lower().startswith(("http://", "https://", "//")):
-                    closing = " (external link)</span>"
 
         self.parts.append(opening)
         if tag not in _VOID_TAGS:
@@ -188,7 +199,7 @@ def write_lesson(out: Path, lesson: Lesson, files: Mapping[str, Path]) -> Path:
     links = {}
     for asset_id, file in files.items():
         resolved = file.resolve()
-        if resolved.is_relative_to(root) and resolved.is_file():
+        if resolved.is_relative_to(root):
             links[asset_id] = _relative_url(resolved, resolved_directory)
 
     parser = _LessonHTML(links)

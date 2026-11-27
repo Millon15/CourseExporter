@@ -11,18 +11,26 @@ ORIGIN = "https://school.kwiga.test"
 COURSE_ID = "example-course-1"
 COURSE = f"{ORIGIN}/courses/{COURSE_ID}"
 LESSON = f"{COURSE}/welcome"
+QUIZ = f"{LESSON}/quizzes/1234"
 FIXTURES = Path(__file__).resolve().parents[2] / "peer-chat" / "course-download" / "fixtures"
 
 
 class FixtureBrowser:
-    def __init__(self, pages):
+    def __init__(self, pages, rendered=None):
         self.pages = pages
         self.calls = []
+        self.rendered = rendered or {}
+        self.render_calls = []
 
     def evaluate(self, url, script):
         self.calls.append((url, script))
         page = self.pages[url]
         return page(script) if callable(page) else page
+
+    def render(self, url, script, ready_selector, timeout_s=45):
+        self.render_calls.append((url, script, ready_selector, timeout_s))
+        page = self.rendered[url]
+        return page() if callable(page) else page
 
 
 def read_fixture(name):
@@ -114,6 +122,69 @@ class KwigaTests(unittest.TestCase):
         self.assertIn("Kwiga info unit type unknown was not exported.", lesson.html)
         self.assertIn("Available text", lesson.html)
         self.assertNotIn("A private response", lesson.html)
+
+    def test_type_four_file_block_preserves_its_title_and_resolves_by_file_id(self):
+        url = "https://cdn.example.test/workbook.xlsx?sig=fixture"
+
+        def projection(script):
+            self.assertIn("[2, 3, 4].includes(unit.type_id)", script)
+            if script.endswith(', "91")'):
+                return {"file": {"url": url}}
+            return {"section": {"info_units": [
+                {"type_id": 2, "files": [{"id": 8, "mime_type": "video/mp4"}]},
+                {"type_id": 4, "title": "Working <capital>", "files": [{"id": 91, "name": "cashflow.xlsx"}]},
+            ]}}
+
+        browser = FixtureBrowser({LESSON: projection})
+        lesson = self.provider.extract(browser, self.ref)
+        self.assertEqual([asset.asset_id for asset in lesson.assets], ["8", "91"])
+        self.assertIn('<h3>Working &lt;capital&gt;</h3>\n<p><a href="asset:91">cashflow.xlsx</a></p>', lesson.html)
+        self.assertNotIn("not exported", lesson.html)
+        media = self.provider.resolve(browser, self.ref, lesson.assets[1])
+        self.assertEqual((media.kind, media.url), ("file", url))
+
+    def test_type_five_uses_only_the_quiz_name_and_task_descriptions(self):
+        quiz = {"link": urlsplit(QUIZ).path, "name": "Homework & practice", "answers": "Private DTO answer"}
+        page = {"section": {"info_units": [{"type_id": 5, "quizzes": [quiz]}]}}
+        signed = "https://cdn.example.test/diagram.png?sig=fixture"
+        projection = {
+            "questions": ['<p onclick="bad()">First question</p><img src="asset:quiz-1234-1" alt="Diagram">',
+                          '<p>Second question</p><a href="https://example.test/reading">Reading</a>'],
+            "images": [{"url": signed, "title": "Diagram"}],
+            "answers": ["Private student answer"], "comments": ["Private curator comment"],
+        }
+        browser = FixtureBrowser({LESSON: page}, {QUIZ: projection})
+
+        lesson = self.provider.extract(browser, self.ref)
+
+        self.assertIn("<h3>Homework &amp; practice</h3>", lesson.html)
+        self.assertIn("<p>First question</p>", lesson.html)
+        self.assertIn("<p>Second question</p>", lesson.html)
+        self.assertIn('<a href="https://example.test/reading" rel="noreferrer">Reading</a>', lesson.html)
+        self.assertIn('<img src="asset:quiz-1234-1" alt="Diagram">', lesson.html)
+        self.assertEqual(lesson.assets, (Asset("quiz-1234-1", "image", "Diagram", "quiz-1234-1"),))
+        self.assertNotIn("Private", repr(lesson))
+        self.assertNotIn(signed, repr(lesson))
+        self.assertNotIn("onclick", lesson.html)
+        self.assertNotIn("not exported", lesson.html)
+        url, script, ready, timeout = browser.render_calls[0]
+        self.assertEqual((url, ready, timeout), (QUIZ, ".practice-question .practice-question-description", 45))
+        self.assertIn("document.querySelectorAll(selector)", script)
+
+        fresh = signed.replace("fixture", "fresh")
+        browser.rendered[QUIZ] = {**projection, "images": [{"url": fresh}]}
+        media = self.provider.resolve(browser, self.ref, lesson.assets[0])
+        self.assertEqual((media.kind, media.url, media.headers), ("file", fresh, {"Referer": f"{ORIGIN}/"}))
+        self.assertEqual([url for url, *_ in browser.render_calls], [QUIZ, QUIZ])
+
+    def test_quiz_link_cannot_send_browser_outside_its_lesson(self):
+        for link in ("https://outside.test/courses/course/welcome/quizzes/1234", f"{QUIZ}/grades", f"{COURSE}/other/quizzes/1234"):
+            with self.subTest(link=link):
+                page = {"section": {"info_units": [{"type_id": 5, "quizzes": [{"link": link}]}]}}
+                browser = FixtureBrowser({LESSON: page})
+                with self.assertRaisesRegex(BrowserError, "outside the lesson or invalid"):
+                    self.provider.extract(browser, self.ref)
+                self.assertEqual(browser.render_calls, [])
 
     def test_gated_lesson_has_no_assets(self):
         browser = FixtureBrowser({LESSON: {"available": False}})

@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 AssetKind = Literal["video", "image", "file"]
-MediaKind = Literal["hls", "mp4", "file"]
+MediaKind = Literal["hls", "mp4", "file", "pdf"]
+"""`pdf` is a page the owner's Chrome prints; its url is the page, never a signed file."""
 
 
 @dataclass(frozen=True)
@@ -61,9 +62,22 @@ class BrowserError(Exception):
     """The Mac browser call failed; the message never carries a URL query string or page content."""
 
 
+class PageNotReady(BrowserError):
+    """A page opened but its ready element never appeared within the wait."""
+
+
 class Browser(Protocol):
     def evaluate(self, url: str, script: str) -> Any:
         """Open `url` in the owner's Chrome and return the JSON value of the JavaScript expression `script`."""
+        ...
+
+    def render(self, url: str, script: str, ready_selector: str, timeout_s: float = 45) -> Any:
+        """Open `url` in a fresh tab, wait until `ready_selector` matches, evaluate `script` there, close the tab."""
+        ...
+
+    def pdf(self, url: str, ready_selector: str = "", timeout_s: float = 60) -> bytes:
+        """Open `url` in a fresh tab, wait for `ready_selector` (raises PageNotReady) and steady text, expand collapsed
+        toggles and return the page printed to PDF."""
         ...
 
 

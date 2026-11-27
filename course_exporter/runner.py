@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Generator, Protocol, Sequence
 
-from . import media
-from .model import Asset, Browser, Lesson, LessonRef, Provider, UnsupportedMedia
+from . import links, media
+from .model import Asset, Browser, Lesson, LessonRef, Media, PageNotReady, Provider, UnsupportedMedia
 from .publish import AdmissionTimeout, BudgetError, DrivePublisher, PublishError, SpaceGuard
 from .state import CourseState, LessonStatus, VerifiedFile
 
@@ -43,6 +43,9 @@ class ExportOptions:
     """Stop once this many videos were verified in this run (the pilot uses 1); later assets stay pending."""
     rediscover: bool = False
     decode: bool = False
+    refresh_pages: bool = False
+    """Re-extract and republish every published lesson: new text and new assets land, files already on Drive are
+    linked, not fetched again."""
 
 
 @dataclass(frozen=True)
@@ -82,10 +85,10 @@ class Exporter:
         for position, (ref, status) in enumerate(lessons, start=1):
             if self._stopped or self._should_stop(options, position):
                 break
-            if status in self._finished:
+            if status in self._finished and not (options.refresh_pages and status in ("done", "published")):
                 continue
             progress = f"[{position}/{len(lessons)}]"
-            if status != "done":
+            if status != "done" or options.refresh_pages:
                 status = self._export_lesson(ref, options, progress)
                 self._count_streak(status, ref)
             if status == "done" and self._publisher is not None:
@@ -121,6 +124,7 @@ class Exporter:
             self._state.set_lesson(ref.lesson_id, "gated")
             self._log(f"{progress} {ref.title}: gated")
             return "gated"
+        lesson = links.add_materials(lesson)
         try:
             with self._reservation(lesson, options) as abort:
                 files = self._export_assets(lesson, options, abort)
@@ -160,10 +164,11 @@ class Exporter:
 
     def _export_assets(self, lesson: Lesson, options: ExportOptions,
                        abort: Callable[[], str | None]) -> dict[str, Path]:
+        on_drive = self._state.was_published(lesson.ref.lesson_id)
         files: dict[str, Path] = {}
         for asset in lesson.assets:
             known = self._state.verified_path(lesson.ref.lesson_id, asset.asset_id)
-            if known is not None and known.is_file():
+            if known is not None and (known.is_file() or on_drive):
                 files[asset.asset_id] = known
                 continue
             if self._enough_videos(options):
@@ -180,8 +185,8 @@ class Exporter:
         try:
             if reason := abort():
                 raise media.Aborted(reason)
-            source = self._provider.resolve(self._browser, ref, asset)
-            path = self._fetch(source, asset, stem, options.max_height, abort=abort)
+            source = self._resolve(ref, asset)
+            path = self._download(source, asset, stem, options, abort)
             verified = self._verify(path, asset, options, asset.expected_seconds or source.expected_seconds)
         except media.Aborted:
             _discard_partials(stem)
@@ -195,6 +200,44 @@ class Exporter:
         self._state.mark_verified(ref.lesson_id, asset, verified)
         self._videos_verified += asset.kind == "video"
         return verified.path
+
+    def _resolve(self, ref: LessonRef, asset: Asset) -> Media:
+        if links.is_material(asset):
+            return links.resolve(asset)
+        return self._provider.resolve(self._browser, ref, asset)
+
+    def _download(self, source: Media, asset: Asset, stem: Path, options: ExportOptions,
+                  abort: Callable[[], str | None]) -> Path:
+        if source.kind == "pdf":
+            return self._save_pdf(source, stem)
+        path = self._fetch(source, asset, stem, options.max_height, abort=abort)
+        if not links.is_material(asset):
+            return path
+        self._refuse_html(path)
+        return links.name_by_content(path)
+
+    def _save_pdf(self, source: Media, stem: Path) -> Path:
+        """Prints the page in the owner's Chrome; a finished file from an earlier run is reused, like media.download."""
+        target = stem.with_name(stem.name + ".pdf")
+        if target.is_file() and target.stat().st_size > 0:
+            return target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_name(target.name + ".part")
+        try:
+            printed = self._browser.pdf(source.url, links.ready_selector(source))
+        except PageNotReady as reason:
+            raise UnsupportedMedia(f"the page never showed its content, likely a sign-in wall or a removed page: "
+                                   f"{reason}") from None
+        partial.write_bytes(printed)
+        os.replace(partial, target)
+        return target
+
+    def _refuse_html(self, path: Path) -> None:
+        try:
+            links.refuse_html(path)
+        except UnsupportedMedia:
+            media.set_aside(path)
+            raise
 
     def _verify(self, path: Path, asset: Asset, options: ExportOptions, expected_seconds: float | None) -> VerifiedFile:
         try:
