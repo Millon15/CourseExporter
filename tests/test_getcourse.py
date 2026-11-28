@@ -187,6 +187,14 @@ class GetCourseTests(unittest.TestCase):
         media = self.provider.resolve(browser, self.ref, lesson.assets[3])
         self.assertEqual((media.kind, media.url), ("file", file_url))
 
+    def test_homework_task_text_is_exported_without_answers_or_the_send_form(self):
+        from course_exporter.providers.getcourse import _LESSON
+        self.assertIn("const mission = '.lesson-mission-text';", _LESSON)
+        for answer in (".self-answers", ".other-answers", ".answer_wrapper", ".lesson-send-answer-block"):
+            self.assertIn(answer, _LESSON.split("const answers = ", 1)[1].split(";", 1)[0])
+        browser = FixtureBrowser({LESSON: {"html": "<p>Lesson</p>\n<h3>Задание</h3><p>Task</p>"}})
+        self.assertIn("<h3>Задание</h3><p>Task</p>", self.provider.extract(browser, self.ref).html)
+
     def test_gated_lesson_has_no_assets(self):
         browser = FixtureBrowser({LESSON: {"gated": True, "frames": [{"url": PLAYER}]}})
         lesson = self.provider.extract(browser, self.ref)

@@ -97,6 +97,8 @@ _LESSON = r"""(page, absolute) => {
         '.lt-lesson-mission', '.lesson-navigation', '.lesson-access-denied',
         'script', 'style', 'template',
     ].join(', ');
+    const mission = '.lesson-mission-text';
+    const answers = '.self-answers, .other-answers, .answer_wrapper, .lesson-send-answer-block, .comments, .gc-comment';
     const frames = [], videos = [], assets = [], markup = [], outsidePlayers = [];
     const seen = new Map();
     const counts = {image: 0, file: 0};
@@ -131,8 +133,7 @@ _LESSON = r"""(page, absolute) => {
         const placeholder = videoPlaceholder(element, 'video-' + index, label);
         if (!insideContent) outsidePlayers.push(placeholder.outerHTML);
     }
-    for (const root of page.querySelectorAll(content)) {
-        if (root.parentElement?.closest(content) || root.closest(excluded)) continue;
+    const adopt = root => {
         const copy = root.cloneNode(true);
         copy.querySelectorAll(excluded + ', iframe').forEach(element => element.remove());
         for (const element of copy.querySelectorAll('video, img, a[href]')) {
@@ -165,7 +166,16 @@ _LESSON = r"""(page, absolute) => {
                 }
             }
         }
-        markup.push(copy.innerHTML);
+        return copy.innerHTML;
+    };
+    for (const root of page.querySelectorAll(content)) {
+        if (root.parentElement?.closest(content) || root.closest(excluded)) continue;
+        markup.push(adopt(root));
+    }
+    // The homework block holds the authors' task beside the owner's answer and the curator thread: only the task.
+    for (const task of page.querySelectorAll(mission)) {
+        if (task.parentElement?.closest(mission) || task.closest(answers)) continue;
+        markup.push('<h3>Задание</h3>' + adopt(task));
     }
     return {
         login: !!page.querySelector('form[action*="/login"], form.state-login'),
