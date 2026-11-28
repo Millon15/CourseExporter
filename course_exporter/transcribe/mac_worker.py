@@ -119,6 +119,14 @@ class Remote:
         _require(effective.get("identitiesonly") == "yes", f"{self._host} lacks IdentitiesOnly yes")
         _require(effective.get("identityagent") == "none", f"{self._host} may use an ssh agent")
 
+    def check_restricted(self) -> None:
+        """Refuses a server that runs this key as a login: Tailscale SSH on port 22 ignores authorized_keys and its
+        forced command, so an invalid verb must come back as the wrapper's own refusal, never from a shell."""
+        result = self._run(self._argv("status", "self-test"), input=b"", capture_output=True, check=False)
+        answer = result.stderr.decode(errors="replace")
+        _require(result.returncode == 2 and answer.startswith("error: 2: "),
+                 f"{self._host} did not refuse an invalid verb (exit {result.returncode}); it is not the restricted key")
+
     def request(self) -> dict[str, Any]:
         return json.loads(self._call("request"))
 
@@ -368,6 +376,7 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_BUSY
         remote = Remote(args.host, args.ssh_config)
         remote.check_identity()
+        remote.check_restricted()
         return _run(Worker(remote, scratch, LazyD2(), log=_log), args.once)
 
 

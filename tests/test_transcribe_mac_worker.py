@@ -220,6 +220,17 @@ class RemoteTest(unittest.TestCase):
         self.assertEqual(seen[1], (seen[1][0], b"{}"))
         self.assertEqual(seen[1][0][-2:], ["submit", "L1"])
 
+    def test_check_restricted_needs_the_wrappers_refusal(self):
+        def answer(code, stderr):
+            return lambda argv, input, capture_output, check: SimpleNamespace(returncode=code, stdout=b"",
+                                                                               stderr=stderr)
+
+        mac_worker.Remote(run=answer(2, b"error: 2: verb or argument is outside the allowlist\n")).check_restricted()
+        for code, stderr in ((127, b"bash: line 1: status: command not found\n"), (0, b""),
+                             (2, b"usage: something else\n")):
+            with self.subTest(code=code), self.assertRaises(ValueError):
+                mac_worker.Remote(run=answer(code, stderr)).check_restricted()
+
     def test_nothing_ready_is_no_lease(self):
         def run(argv, input, capture_output, check):
             return SimpleNamespace(returncode=4, stdout=b"", stderr=b"error: empty: nothing ready")

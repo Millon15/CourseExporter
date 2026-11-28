@@ -41,8 +41,13 @@ Every published course video gets a transcript that UniversalCourseHost reads be
    its wildcard `IdentityFile` lines, an agent or a shared ControlMaster socket can never offer the operator's
    login. The worker checks `ssh -G` before every run and refuses anything but exactly one identity:
 
+   On the VPS, port 22 on the tailnet address is Tailscale SSH, which ignores `authorized_keys` and so the forced
+   command; the alias must use OpenSSH's tailnet port 2222. Before each run the worker sends one invalid verb and
+   refuses to continue unless the wrapper itself refuses it.
+
    ```text
    Host jarvis-transcribe
+     Port 2222
      User openclaw
      IdentityFile ~/.ssh/jarvis_transcribe_ed25519
      IdentitiesOnly yes
