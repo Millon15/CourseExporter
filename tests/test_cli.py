@@ -41,6 +41,13 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(file.path, archive.lesson_dir(self.out, REF) / "file-1-Рабочая таблица.docx")
         self.assertEqual((file.bytes, file.md5), (13108, "abc"))
 
+    def test_records_a_video_length(self):
+        self.assertEqual(self.record("--name", "video.mp4", "--duration", "1198.4"), 0)
+        state = CourseState(self.out / cli.STATE_FILE)
+        [file] = state.verified_files("345")
+        state.close()
+        self.assertEqual(file.duration, 1198.4)
+
     def test_refuses_a_path_and_an_unknown_asset(self):
         self.assertEqual(self.record("--name", "../escape.docx"), cli.EXIT_USAGE)
         self.assertEqual(self.record("--name", "x.docx", "--asset", "file-9"), cli.EXIT_USAGE)

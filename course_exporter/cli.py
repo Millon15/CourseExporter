@@ -72,6 +72,7 @@ def _parser(settings: config.Settings) -> argparse.ArgumentParser:
     record.add_argument("--bytes", required=True, type=int)
     record.add_argument("--md5", required=True)
     record.add_argument("--sha256", default="")
+    record.add_argument("--duration", type=float, default=0.0, help="video length in seconds, from ffprobe")
     record.set_defaults(command=_record)
     from .transcribe import cli as transcribe
 
@@ -138,7 +139,7 @@ def _record(args: argparse.Namespace) -> int:
                 print(f"no lesson {args.lesson} in {args.out}", file=sys.stderr)
                 return EXIT_USAGE
             path = archive.lesson_dir(args.out, refs[args.lesson]) / args.name
-            state.record_file(args.lesson, args.asset, VerifiedFile(path, args.bytes, args.sha256, md5=args.md5.lower()))
+            state.record_file(args.lesson, args.asset, VerifiedFile(path, args.bytes, args.sha256, args.duration, md5=args.md5.lower()))
         except KeyError as error:
             print(error.args[0], file=sys.stderr)
             return EXIT_USAGE

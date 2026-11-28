@@ -137,9 +137,9 @@ class CourseState:
         the owner's browser); raises KeyError for an asset the state has never seen."""
         with self._db:
             updated = self._db.execute(
-                "UPDATE assets SET status = 'verified', path = ?, bytes = ?, sha256 = ?, md5 = ?, duration = 0,"
+                "UPDATE assets SET status = 'verified', path = ?, bytes = ?, sha256 = ?, md5 = ?, duration = ?,"
                 " detail = 'recorded by hand', updated_at = ? WHERE lesson_id = ? AND asset_id = ?",
-                (str(file.path), file.bytes, file.sha256, file.md5, _now(), lesson_id, asset_id),
+                (str(file.path), file.bytes, file.sha256, file.md5, file.duration, _now(), lesson_id, asset_id),
             ).rowcount
         if not updated:
             raise KeyError(f"no asset {asset_id} in lesson {lesson_id}")
