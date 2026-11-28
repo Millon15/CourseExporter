@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from course_exporter.transcribe import segments
+from course_exporter.transcribe import d2_pins, segments
 
 DELETE = object()
 
@@ -100,6 +100,37 @@ class RenderTest(unittest.TestCase):
 
     def test_vtt_time_handles_hours(self):
         self.assertEqual(segments._vtt_time(3725.0506), "01:02:05.051")
+
+
+
+def d2_document():
+    doc = copy.deepcopy(document())
+    doc["segments"][2]["words"] = [{"start": 6.0, "end": 9.9, "text": "Так.", "speaker": "S2", "flag": None}]
+    return doc | {"pipeline": "D2", "result_version": 1, "producer_config": d2_pins.PRODUCER_CONFIG}
+
+
+class ValidateD2Test(unittest.TestCase):
+    def test_accepts_a_d2_document(self):
+        segments.validate(d2_document())
+
+    def test_rejects_what_only_d2_requires(self):
+        cases = {
+            "result version": d2_document() | {"result_version": 2},
+            "no result version": {k: v for k, v in d2_document().items() if k != "result_version"},
+            "another config": d2_document() | {"producer_config": "d2-other"},
+        }
+        offset = d2_document()
+        offset["source"]["offset_s"] = 1.5
+        cases["offset"] = offset
+        wordless = d2_document()
+        del wordless["segments"][2]["words"]
+        cases["cue without words"] = wordless
+        for name, doc in cases.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                segments.validate(doc)
+
+    def test_a_d_document_needs_no_d2_fields(self):
+        segments.validate(document())
 
 
 if __name__ == "__main__":

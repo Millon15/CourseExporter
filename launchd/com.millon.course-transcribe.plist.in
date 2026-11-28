@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Hourly D2 worker while the Mac is awake. Opt-in only: see docs/transcribe.md, "Hourly on the Mac". -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.millon.course-transcribe</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@UV@</string>
+    <string>run</string>
+    <string>--frozen</string>
+    <string>--project</string>
+    <string>@REPO@/tools/transcribe-d2</string>
+    <string>python</string>
+    <string>-m</string>
+    <string>course_exporter.transcribe.mac_worker</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>@REPO@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@FFMPEG_DIR@:/usr/bin:/bin</string>
+    <key>HF_HUB_OFFLINE</key>
+    <string>1</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>Nice</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/course-transcribe.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/course-transcribe.log</string>
+</dict>
+</plist>

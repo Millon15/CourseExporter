@@ -11,8 +11,10 @@ import re
 from pathlib import Path
 from typing import Any
 
+from . import d2_pins
+
 SCHEMA = "uch-segments/1"
-PIPELINES = frozenset({"A", "D"})
+PIPELINES = frozenset({"A", "D", "D2"})
 LANGUAGES = frozenset({"ru", "uk"})
 WORD_FLAGS = frozenset({None, "no_turn", "ambiguous"})
 STAGES = frozenset({"load", "asr", "diarize", "merge", "upload", "api", "total"})
@@ -25,13 +27,15 @@ def validate(doc: dict[str, Any]) -> None:
     """Raises `ValueError` naming the first rule the document breaks."""
     _require(isinstance(doc, dict), "document is not an object")
     _require(doc.get("schema") == SCHEMA, f"schema is not {SCHEMA}")
-    _require(doc.get("pipeline") in PIPELINES, "pipeline is not A or D")
+    _require(doc.get("pipeline") in PIPELINES, "pipeline is not A, D or D2")
     _require(_is_text(doc.get("producer_config")), "producer_config is empty")
     _require(doc.get("language") in LANGUAGES, "language is not ru or uk")
     duration = _validate_source(doc.get("source"))
     _validate_segments(doc.get("segments"), duration)
     _validate_speakers(doc.get("speakers"), doc["segments"])
     _validate_run(doc.get("run"))
+    if doc["pipeline"] == "D2":
+        _validate_d2(doc)
 
 
 def write(doc: dict[str, Any], directory: Path, stem: str) -> list[Path]:
@@ -114,6 +118,14 @@ def _speakers_in_order(segments: list[dict[str, Any]]) -> list[str]:
         spoken.append(segment.get("speaker"))
         spoken.extend(word.get("speaker") for word in segment.get("words") or [])
     return [speaker for speaker in spoken if speaker is not None]
+
+
+def _validate_d2(doc: dict[str, Any]) -> None:
+    """D2 runs on the Mac over a whole video: pinned config, result version 1, offset 0, every cue with its words."""
+    _require(doc.get("result_version") == d2_pins.RESULT_VERSION, "result_version is not 1")
+    _require(doc["producer_config"] == d2_pins.PRODUCER_CONFIG, "producer_config is not the pinned D2 config")
+    _require(doc["source"]["offset_s"] == 0, "source.offset_s is not 0 for a full-video D2 result")
+    _require(all(isinstance(s.get("words"), list) for s in doc["segments"]), "a D2 segment has no words")
 
 
 def _validate_run(run: Any) -> None:

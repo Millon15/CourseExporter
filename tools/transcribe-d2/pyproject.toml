@@ -1,0 +1,17 @@
+[project]
+name = "course-exporter-transcribe-d2"
+version = "0.1.0"
+description = "Pipeline D2 on the Mac: Parakeet v3 (MLX) + Nemotron 3 Diarization, pinned as benchmarked 2026-11-27"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "huggingface-hub>=1,<2",
+    "mlx>=0.29,<1",
+    "parakeet-mlx==0.7.0",
+    "torch>=2.8,<3",
+    "transformers==5.24.1",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
+required-environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
