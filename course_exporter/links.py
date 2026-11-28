@@ -7,18 +7,22 @@
 | docs.google.com/presentation/d/<id> | PDF export |
 | drive.google.com/file/d/<id>, open?id=, uc?id= | the file itself |
 | <x>.notion.site/..<32 hex>, notion.so/..<32 hex> | PDF printed in the owner's Chrome |
+| docs.google.com/forms/d/e/<id>, forms.gle/<code> | PDF of the form's questions, printed in the owner's Chrome |
+| calendar.google.com/..?cid=<base64 calendar id> | the public calendar as .ics |
 | any https URL whose path ends in a document suffix | the file itself |
 
 Everything else stays a plain link."""
 
 from __future__ import annotations
 
+import base64
+import binascii
 from dataclasses import dataclass, replace
 import hashlib
 from html import unescape
 from pathlib import Path, PurePosixPath
 import re
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from .model import Asset, Lesson, Media, MediaKind, UnsupportedMedia
 
@@ -33,6 +37,10 @@ _GOOGLE_DOC = re.compile(r"/(document|spreadsheets|presentation)/d/([A-Za-z0-9_-
 _DRIVE_FILE = re.compile(r"/file/d/([A-Za-z0-9_-]{20,})")
 _DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{20,}\Z")
 _NOTION_ID = re.compile(r"([0-9a-f]{32})\Z")
+_GOOGLE_FORM = re.compile(r"/forms/d/e/([A-Za-z0-9_-]{20,})")
+_SHORT_FORM = re.compile(r"/([A-Za-z0-9]{8,})/?\Z")
+FORM_READY = 'form[action*="formResponse"]'
+"""Only an open form renders its questions inside this form; a sign-in wall or a closed form never does."""
 _HTML_START = re.compile(rb"(?:\xef\xbb\xbf)?\s*(<!doctype html|<html)", re.I)
 UNKNOWN_SUFFIX = ".bin"
 ZIP_TAIL = 1 << 16
@@ -123,7 +131,11 @@ def classify(url: str) -> Material | None:
         return None
     host = parts.hostname.lower()
     if host == "docs.google.com":
-        return _google_doc(parts.path)
+        return _google_form(parts.path) or _google_doc(parts.path)
+    if host == "forms.gle":
+        return _short_form(parts.path)
+    if host == "calendar.google.com":
+        return _calendar(parts.query)
     if host == "drive.google.com":
         return _drive_file(parts.path, parts.query)
     if host.endswith(".notion.site") or host in ("notion.so", "www.notion.so"):
@@ -140,6 +152,34 @@ def _google_doc(path: str) -> Material | None:
     export = {"document": ("/export?format=pdf", ".pdf"), "spreadsheets": ("/export?format=xlsx", ".xlsx"),
               "presentation": ("/export/pdf", ".pdf")}[kind]
     return Material(base, "file", base + export[0], export[1])
+
+
+def _google_form(path: str) -> Material | None:
+    match = _GOOGLE_FORM.search(path)
+    if match is None:
+        return None
+    form = f"https://docs.google.com/forms/d/e/{match[1]}"
+    return Material(form, "pdf", form + "/viewform", ".pdf", FORM_READY)
+
+
+def _short_form(path: str) -> Material | None:
+    match = _SHORT_FORM.fullmatch(path)
+    if match is None:
+        return None
+    form = f"https://forms.gle/{match[1]}"
+    return Material(form, "pdf", form, ".pdf", FORM_READY)
+
+
+def _calendar(query: str) -> Material | None:
+    encoded = (parse_qs(query).get("cid") or [""])[0]
+    try:
+        calendar_id = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode()
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+    if not re.fullmatch(r"[\w.+-]+@[\w.-]+", calendar_id):
+        return None
+    ics = f"https://calendar.google.com/calendar/ical/{quote(calendar_id, safe='')}/public/basic.ics"
+    return Material(ics, "file", ics, ".ics")
 
 
 def _drive_file(path: str, query: str) -> Material | None:

@@ -35,11 +35,18 @@ class ClassifyTest(unittest.TestCase):
             ("pdf", "https://www.notion.so/team/0123456789abcdef0123456789abcdef", ".pdf"),
         "https://files.school.test/guide/Instruction.PDF#page=2":
             ("file", "https://files.school.test/guide/Instruction.PDF", ".pdf"),
+        "https://docs.google.com/forms/d/e/1FAIpQLSeFormIdFormIdFormId/viewform?usp=sharing&ouid=1":
+            ("pdf", "https://docs.google.com/forms/d/e/1FAIpQLSeFormIdFormIdFormId/viewform", ".pdf"),
+        "https://forms.gle/4fHNegYXdMXJUDmd9": ("pdf", "https://forms.gle/4fHNegYXdMXJUDmd9", ".pdf"),
+        "https://calendar.google.com/calendar/u/3?cid=YWJjQGdyb3VwLmNhbGVuZGFyLmdvb2dsZS5jb20":
+            ("file", "https://calendar.google.com/calendar/ical/abc%40group.calendar.google.com/public/basic.ics",
+             ".ics"),
     }
     PLAIN = ["https://www.instagram.com/someone/", "https://t.me/channel", "https://www.figma.com/file/abc/x",
              "http://docs.google.com/document/d/1DocIdDocIdDocIdDocIdDocId/edit",
              "https://drive.google.com/drive/folders/1FolderIdFolderIdFolder", "https://notion.site/no-id-here",
-             "https://user:pw@files.school.test/a.pdf", "mailto:x@y.test"]
+             "https://user:pw@files.school.test/a.pdf", "mailto:x@y.test",
+             "https://calendar.google.com/calendar/u/0?cid=bm90IGFuIGlk", "https://forms.gle/"]
 
     def test_each_material_shape_maps_to_its_export(self):
         for url, (kind, source, suffix) in self.CASES.items():
@@ -55,6 +62,12 @@ class ClassifyTest(unittest.TestCase):
     def test_one_material_linked_twice_has_one_canonical_form(self):
         self.assertEqual(links.classify(SHEET).canonical, links.classify(SHEET.replace("/edit?usp=sharing", "")).canonical)
 
+
+    def test_a_form_counts_as_rendered_only_once_its_questions_show(self):
+        for url in ("https://forms.gle/4fHNegYXdMXJUDmd9",
+                    "https://docs.google.com/forms/d/e/1FAIpQLSeFormIdFormId0/viewform"):
+            with self.subTest(url=url):
+                self.assertEqual(links.classify(url).ready_selector, 'form[action*="formResponse"]')
 
     def test_a_notion_database_page_counts_as_rendered_by_its_view(self):
         calendar = links.classify("https://chatter-atom-bdf.notion.site/0123456789abcdef0123456789abcdef?v=01234567")
