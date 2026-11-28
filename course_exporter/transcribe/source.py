@@ -55,7 +55,7 @@ DURATION_SLACK_SECONDS = 2.0
 DURATION_TOLERANCE = 0.01
 OPUS = ["-vn", "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "32k", "-f", "ogg"]
 
-EXTRACTION_CONFIG = "opus-v1:" + " ".join(OPUS)
+EXTRACTION_CONFIG = "opus-v2:" + " ".join(OPUS)
 
 Runner = Callable[..., subprocess.CompletedProcess]
 Opener = Callable[..., Any]
@@ -174,8 +174,8 @@ class DriveApi:
 
     def _get(self, url: str, headers: dict[str, str] | None = None) -> Any:
         for delay in (*RETRY_DELAYS, None):
-            request = urllib.request.Request(url, headers={**(headers or {}),
-                                                           "Authorization": f"Bearer {self._token.bearer()}"})
+            request = urllib.request.Request(url, headers=headers or {})
+            request.add_unredirected_header("Authorization", f"Bearer {self._token.bearer()}")
             try:
                 return self._opener(request, timeout=120)
             except urllib.error.HTTPError as exc:
@@ -313,7 +313,8 @@ class AudioCache:
 
     def _transcode_stream(self, source: DriveFile, part: Path, limit: int) -> None:
         digest, size = hashlib.md5(), 0
-        with self._api.media(source.id) as response, _ffmpeg(self._ffmpeg, ["-i", "pipe:0"], part, limit) as process:
+        mp4 = ["-f", "mov", "-enable_drefs", "0", "-protocol_whitelist", "pipe", "-i", "pipe:0"]
+        with self._api.media(source.id) as response, _ffmpeg(self._ffmpeg, mp4, part, limit) as process:
             try:
                 for chunk in iter(lambda: response.read(CHUNK), b""):
                     if self._headroom is not None:
@@ -331,7 +332,8 @@ class AudioCache:
             raise SourceError(f"Drive file {source.id} streamed {size} bytes that differ from the pinned MD5")
 
     def _transcode_seekable(self, source: DriveFile, part: Path, limit: int | None = None) -> None:
-        manifest = ["-f", "concat", "-safe", "0", "-protocol_whitelist", "pipe,http,tcp", "-i", "pipe:0"]
+        manifest = ["-f", "concat", "-safe", "0", "-format_whitelist", "concat,mov",
+                    "-protocol_whitelist", "pipe,http,tcp", "-i", "pipe:0"]
         with _loopback_proxy(self._api, source, headroom=self._headroom) as url:
             secret = url.rsplit("/", 2)[1]
             try:
@@ -371,7 +373,9 @@ class AudioCache:
 
     def _prepare_root(self) -> None:
         self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._root.chmod(0o700)
+        info = self._root.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise SourceError("audio cache must be an owned, private directory")
         free = shutil.disk_usage(self._root).free
         if free < self._min_free:
             raise LowSpace(f"{free // GIB} GiB free under {self._root}; the floor is {self._min_free // GIB} GiB")

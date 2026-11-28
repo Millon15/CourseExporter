@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.request
+import wave
 from pathlib import Path
 from unittest import mock
 
@@ -155,6 +156,20 @@ class DriveApiTest(unittest.TestCase):
         self.assertEqual(api.metadata("F"), source.DriveFile("F", "v.mp4", 3, "ab", "r", ("P",)))
         self.assertEqual(attempts, ["Bearer tok"] * 3)
 
+    def test_reader_authorization_is_sent_only_to_the_original_request(self):
+        attempts = []
+
+        def opener(request, timeout):
+            handler = urllib.request.HTTPRedirectHandler()
+            forwarded = handler.redirect_request(request, None, 302, "Found", {}, "https://other.invalid/media")
+            attempts.append((request.get_header("Authorization"), forwarded.get_header("Authorization")))
+            return Response(b"payload")
+
+        api = source.DriveApi(self.Token(), opener=opener)
+        with api.media("F") as response:
+            self.assertEqual(response.read(), b"payload")
+        self.assertEqual(attempts, [("Bearer tok", None)])
+
     def test_refuses_a_trashed_file_and_a_permanent_error(self):
         def trashed(request, timeout):
             return Response(json.dumps({"trashed": True}).encode())
@@ -206,6 +221,36 @@ class AudioCacheTest(unittest.TestCase):
         self.assertEqual(audio.read_path, "range")
         self.assertTrue(any(r for r in api.ranges if r))
         self.assertAlmostEqual(audio.seconds, 4.0, delta=0.2)
+
+    def test_neither_read_route_decodes_a_non_mp4(self):
+        payload = io.BytesIO()
+        with wave.open(payload, "wb") as wav:
+            wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+            wav.writeframes(b"\0\0" * 16000)
+        data = payload.getvalue()
+        api, cache = self.cache(data)
+        with self.assertRaises(source.TranscodeError):
+            cache.audio(drive_file(data), 1)
+        self.assertIsNone(api.ranges[0])
+        self.assertTrue(any(api.ranges[1:]))
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_cache_rejects_a_symlink_and_a_shared_directory_without_changing_modes(self):
+        _, cache = self.cache(b"")
+        outside = Path(self.tmp.name) / "elsewhere"
+        outside.mkdir(mode=0o755)
+        outside.chmod(0o755)
+        self.root.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(source.SourceError, "owned, private directory"):
+            cache._prepare_root()
+        self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
+
+        self.root.unlink()
+        self.root.mkdir(mode=0o755)
+        self.root.chmod(0o755)
+        with self.assertRaisesRegex(source.SourceError, "owned, private directory"):
+            cache._prepare_root()
+        self.assertEqual(self.root.stat().st_mode & 0o777, 0o755)
 
     def test_the_proxy_serves_only_its_secret_path_in_bounded_upstream_ranges(self):
         data = b"0123456789"
