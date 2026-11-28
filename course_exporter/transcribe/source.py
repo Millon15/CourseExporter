@@ -16,7 +16,11 @@ a log line or an error message.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
+import math
+import re
+import stat
 import os
 import secrets
 import shutil
@@ -37,11 +41,12 @@ from .catalog import VideoAsset
 
 DRIVE_FILES = "https://www.googleapis.com/drive/v3/files/"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
-METADATA_FIELDS = "id,name,size,md5Checksum,headRevisionId,parents,trashed"
+METADATA_FIELDS = "id,name,size,md5Checksum,headRevisionId,parents,trashed,videoMediaMetadata(durationMillis)"
 CHUNK = 1 << 20
 RANGE_WINDOW = 8 << 20
 GIB = 1 << 30
-MIN_FREE_BYTES = 5 * GIB
+MIN_FREE_BYTES = 15 * GIB
+CACHE_LIMIT = 2 * GIB
 TOKEN_MARGIN_SECONDS = 120
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 RETRY_DELAYS = (2, 8, 30)
@@ -50,12 +55,18 @@ DURATION_SLACK_SECONDS = 2.0
 DURATION_TOLERANCE = 0.01
 OPUS = ["-vn", "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "32k", "-f", "ogg"]
 
+EXTRACTION_CONFIG = "opus-v1:" + " ".join(OPUS)
+
 Runner = Callable[..., subprocess.CompletedProcess]
 Opener = Callable[..., Any]
 
 
 class SourceError(Exception):
     """The source cannot be read as pinned: missing, ambiguous, changed, or unreadable on both paths."""
+
+
+class SourceChanged(SourceError):
+    """The pinned video no longer identifies the current source."""
 
 
 class LowSpace(SourceError):
@@ -74,6 +85,7 @@ class DriveFile:
     md5: str
     revision: str
     parents: tuple[str, ...]
+    video_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -89,11 +101,13 @@ class RcloneToken:
     """A Drive access token refreshed through the OAuth client and refresh token of one rclone remote."""
 
     def __init__(self, remote: str, rclone: str = "rclone", run: Runner = subprocess.run,
-                 opener: Opener = urllib.request.urlopen, clock: Callable[[], float] = time.monotonic) -> None:
+                 opener: Opener = urllib.request.urlopen, clock: Callable[[], float] = time.monotonic,
+                 config_path: Path | None = None) -> None:
         self._remote = remote.split(":", 1)[0]
         self._rclone, self._run, self._opener, self._clock = rclone, run, opener, clock
         self._token: str | None = None
         self._expires = 0.0
+        self._config_path = config_path
 
     def bearer(self) -> str:
         if self._token is None or self._clock() > self._expires - TOKEN_MARGIN_SECONDS:
@@ -108,12 +122,21 @@ class RcloneToken:
         try:
             with self._opener(request, timeout=60) as response:
                 granted = json.load(response)
+            self._token, self._expires = granted["access_token"], self._clock() + float(granted["expires_in"])
         except urllib.error.HTTPError as exc:
+            exc.close()
             raise SourceError(f"token refresh for {self._remote} failed with HTTP {exc.code}") from None
-        self._token, self._expires = granted["access_token"], self._clock() + float(granted["expires_in"])
+        except (urllib.error.URLError, TimeoutError, ValueError, TypeError, KeyError):
+            raise SourceError(f"token refresh for {self._remote} failed") from None
 
     def _remote_config(self) -> dict[str, str]:
-        result = self._run([self._rclone, "config", "dump"], capture_output=True, text=True, timeout=60)
+        options = []
+        if self._config_path is not None:
+            st = self._config_path.lstat()
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+                raise SourceError("publisher rclone configuration must be a private regular file")
+            options = ["--config", str(self._config_path)]
+        result = self._run([self._rclone, *options, "config", "dump"], capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
             raise SourceError(f"rclone config dump exit {result.returncode}")
         config = json.loads(result.stdout).get(self._remote) or {}
@@ -131,17 +154,23 @@ class DriveApi:
 
     def metadata(self, file_id: str) -> DriveFile:
         query = urlencode({"fields": METADATA_FIELDS, "supportsAllDrives": "true"})
-        with self._get(f"{DRIVE_FILES}{file_id}?{query}") as response:
+        with self._get(f"{DRIVE_FILES}{_file_id(file_id)}?{query}") as response:
             meta = json.load(response)
         if meta.get("trashed"):
-            raise SourceError(f"Drive file {file_id} is in the trash")
-        return DriveFile(id=meta["id"], name=meta["name"], size=int(meta["size"]), md5=meta["md5Checksum"].lower(),
-                         revision=meta.get("headRevisionId", ""), parents=tuple(meta.get("parents", ())))
+            raise SourceChanged(f"Drive file {file_id} is in the trash")
+        millis = (meta.get("videoMediaMetadata") or {}).get("durationMillis")
+        duration = int(millis) / 1000 if millis and int(millis) > 0 else None
+        try:
+            return DriveFile(id=meta["id"], name=meta["name"], size=int(meta["size"]), md5=meta["md5Checksum"].lower(),
+                             revision=meta["headRevisionId"], parents=tuple(meta.get("parents", ())),
+                             video_seconds=duration)
+        except (KeyError, TypeError, ValueError):
+            raise SourceChanged(f"Drive file {file_id} lacks pinned binary metadata") from None
 
     def media(self, file_id: str, byte_range: str | None = None) -> Any:
         """An open response for the file's bytes; `byte_range` is a `Range` header value."""
         query = urlencode({"alt": "media", "supportsAllDrives": "true"})
-        return self._get(f"{DRIVE_FILES}{file_id}?{query}", {"Range": byte_range} if byte_range else {})
+        return self._get(f"{DRIVE_FILES}{_file_id(file_id)}?{query}", {"Range": byte_range} if byte_range else {})
 
     def _get(self, url: str, headers: dict[str, str] | None = None) -> Any:
         for delay in (*RETRY_DELAYS, None):
@@ -150,8 +179,14 @@ class DriveApi:
             try:
                 return self._opener(request, timeout=120)
             except urllib.error.HTTPError as exc:
+                exc.close()
+                if exc.code == 404:
+                    raise SourceChanged("pinned Drive file is unavailable") from None
                 if exc.code not in RETRY_STATUSES or delay is None:
                     raise SourceError(f"Drive GET {url.split('?')[0]} failed with HTTP {exc.code}") from None
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                if delay is None:
+                    raise SourceError("Drive read disconnected or timed out") from None
             self._sleep(delay)
         raise AssertionError("unreachable")
 
@@ -168,7 +203,9 @@ def resolve(asset: VideoAsset, remote: str, api: DriveApi, rclone: str = "rclone
     pinned = api.metadata(matches[0])
     if (pinned.name, pinned.size, pinned.md5) != (asset.name, asset.bytes, asset.md5):
         raise SourceError(f"Drive file {pinned.id} changed between listing and pinning")
-    if folder_id not in pinned.parents:
+    if pinned.id != matches[0] or not pinned.revision:
+        raise SourceError("Drive did not return the requested file and head revision")
+    if pinned.parents != (folder_id,):
         raise SourceError(f"Drive file {pinned.id} is no longer in {folder}")
     return pinned
 
@@ -190,83 +227,144 @@ def _lsjson(run: Runner, argv: list[str]) -> list[dict[str, Any]]:
     return json.loads(result.stdout)
 
 
-class AudioCache:
-    """`<root>/<md5>.opus` with a `<md5>.json` receipt; a cached entry is reused only when its hash still matches."""
+def _file_id(file_id: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", file_id):
+        raise SourceError("invalid Drive ID")
+    return file_id
 
-    def __init__(self, root: Path, api: DriveApi, ffmpeg: str = "ffmpeg", min_free: int = MIN_FREE_BYTES) -> None:
+
+def revision_key(source: DriveFile) -> tuple:
+    return source.id, source.name, source.size, source.md5, source.revision, source.parents
+
+
+def recheck(api: DriveApi, source: DriveFile, when: str) -> DriveFile:
+    fresh = api.metadata(source.id)
+    if revision_key(fresh) != revision_key(source):
+        raise SourceChanged(f"Drive file {source.id} changed {when}")
+    return fresh
+
+
+class AudioCache:
+    """Private cache keyed by the pinned revision and the audio extraction configuration."""
+
+    def __init__(self, root: Path, api: DriveApi, ffmpeg: str = "ffmpeg", min_free: int = MIN_FREE_BYTES,
+                 limit: int = CACHE_LIMIT, headroom: Callable[[int], None] | None = None) -> None:
         self._root, self._api, self._ffmpeg, self._min_free = root, api, ffmpeg, min_free
+        self._limit, self._headroom = limit, headroom
 
     def audio(self, source: DriveFile, expected_seconds: float) -> CachedAudio:
-        """`expected_seconds` is the exporter's probed duration; a decode that falls short of it is a failed one."""
-        cached = self._cached(source)
-        if cached:
-            return cached
+        """Reject partial decodes and save the receipt only while the pinned source is current."""
+        if not math.isfinite(expected_seconds) or expected_seconds <= 0:
+            raise SourceError("missing verified video duration")
         self._prepare_root()
-        part = self._root / f".{source.md5}.opus.part"
-        read_path = self._transcode(source, part, expected_seconds)
-        return self._commit(source, part, read_path)
-
-    def _transcode(self, source: DriveFile, part: Path, expected_seconds: float) -> str:
+        key = self._key(source)
+        cached = self._cached(source, key)
+        if cached:
+            recheck(self._api, source, "before cache reuse")
+            return cached
+        self._discard(key)
+        # Maximum Opus bitrate is 256 kbit/s. Reserve container overhead and receipt space too.
+        allowance = math.ceil(expected_seconds * 36_000) + 256 * 1024
+        used = sum(entry.stat().st_size for entry in self._root.iterdir() if entry.is_file())
+        if allowance > self._limit:
+            raise SourceError("this video exceeds the Opus cache budget")
+        if used + allowance > self._limit or shutil.disk_usage(self._root).free - allowance < self._min_free:
+            raise LowSpace("insufficient headroom for bounded Opus preparation")
+        if self._headroom is not None:
+            self._headroom(allowance)
+        part = self._root / f".{key}.opus.part"
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
         try:
-            self._transcode_stream(source, part)
-            self._require_full_length(part, expected_seconds)
-            return "stream"
-        except TranscodeError:
-            self._transcode_seekable(source, part)
-            self._require_full_length(part, expected_seconds)
-            return "range"
-
-    def _require_full_length(self, part: Path, expected_seconds: float) -> None:
-        seconds = _duration(self._ffmpeg, part)
-        if abs(seconds - expected_seconds) > max(DURATION_SLACK_SECONDS, expected_seconds * DURATION_TOLERANCE):
+            read_path, seconds = self._transcode(source, part, expected_seconds, allowance)
+            if self._headroom is not None:
+                self._headroom(0)
+            recheck(self._api, source, "after the audio read")
+            return self._commit(source, key, part, read_path, seconds)
+        finally:
             part.unlink(missing_ok=True)
-            raise TranscodeError(f"decoded {seconds:.1f} s of a {expected_seconds:.1f} s video")
 
-    def _transcode_stream(self, source: DriveFile, part: Path) -> None:
+    @staticmethod
+    def _key(source: DriveFile) -> str:
+        return hashlib.sha256(json.dumps([revision_key(source), EXTRACTION_CONFIG]).encode()).hexdigest()
+
+    def discard(self, source: DriveFile) -> None:
+        self._discard(self._key(source))
+
+    def _discard(self, key: str) -> None:
+        for name in (f"{key}.opus", f"{key}.json", f".{key}.opus.part", f".{key}.json.part"):
+            (self._root / name).unlink(missing_ok=True)
+
+    def _transcode(self, source: DriveFile, part: Path, expected_seconds: float, limit: int) -> tuple[str, float]:
+        try:
+            self._transcode_stream(source, part, limit)
+            return "stream", self._require_full_length(part, expected_seconds, limit)
+        except TranscodeError:
+            self._transcode_seekable(source, part, limit)
+            return "range", self._require_full_length(part, expected_seconds, limit)
+
+    def _require_full_length(self, part: Path, expected_seconds: float, limit: int) -> float:
+        if part.stat().st_size >= limit - CHUNK // 16:
+            raise TranscodeError("Opus output approached the byte limit")
+        seconds = _decoded_duration(self._ffmpeg, part)
+        if abs(seconds - expected_seconds) > max(DURATION_SLACK_SECONDS, expected_seconds * DURATION_TOLERANCE):
+            raise TranscodeError(f"decoded {seconds:.1f} s of a {expected_seconds:.1f} s video")
+        return seconds
+
+    def _transcode_stream(self, source: DriveFile, part: Path, limit: int) -> None:
         digest, size = hashlib.md5(), 0
-        with self._api.media(source.id) as response, _ffmpeg(self._ffmpeg, ["-i", "pipe:0"], part) as process:
+        with self._api.media(source.id) as response, _ffmpeg(self._ffmpeg, ["-i", "pipe:0"], part, limit) as process:
             try:
                 for chunk in iter(lambda: response.read(CHUNK), b""):
+                    if self._headroom is not None:
+                        self._headroom(0)
                     digest.update(chunk)
                     size += len(chunk)
                     process.stdin.write(chunk)
                 process.stdin.close()
             except BrokenPipeError:
                 raise TranscodeError("ffmpeg stopped reading the stream") from None
+            except (http.client.IncompleteRead, TimeoutError, ConnectionResetError):
+                raise SourceError("Drive stream disconnected or ended early") from None
         if (size, digest.hexdigest()) != (source.size, source.md5):
             part.unlink(missing_ok=True)
             raise SourceError(f"Drive file {source.id} streamed {size} bytes that differ from the pinned MD5")
 
-    def _transcode_seekable(self, source: DriveFile, part: Path) -> None:
+    def _transcode_seekable(self, source: DriveFile, part: Path, limit: int | None = None) -> None:
         manifest = ["-f", "concat", "-safe", "0", "-protocol_whitelist", "pipe,http,tcp", "-i", "pipe:0"]
-        with _loopback_proxy(self._api, source) as url:
+        with _loopback_proxy(self._api, source, headroom=self._headroom) as url:
             secret = url.rsplit("/", 2)[1]
             try:
-                with _ffmpeg(self._ffmpeg, manifest, part) as process:
+                with _ffmpeg(self._ffmpeg, manifest, part, limit) as process:
                     process.stdin.write(f"ffconcat version 1.0\nfile '{url}'\n".encode())
                     process.stdin.close()
             except TranscodeError as exc:
                 raise TranscodeError(str(exc).replace(secret, "<capability>")) from None
-        reread = self._api.metadata(source.id)
-        if (reread.md5, reread.revision, reread.parents) != (source.md5, source.revision, source.parents):
-            part.unlink(missing_ok=True)
-            raise SourceError(f"Drive file {source.id} changed during the seekable read")
+        recheck(self._api, source, "during the seekable read")
 
-    def _commit(self, source: DriveFile, part: Path, read_path: str) -> CachedAudio:
-        audio = self._root / f"{source.md5}.opus"
+    def _commit(self, source: DriveFile, key: str, part: Path, read_path: str, seconds: float) -> CachedAudio:
+        audio = self._root / f"{key}.opus"
+        part.chmod(0o600)
         part.replace(audio)
-        cached = CachedAudio(path=audio, source=source, read_path=read_path, sha256=_sha256(audio),
-                             seconds=_duration(self._ffmpeg, audio))
-        receipt = {**asdict(cached), "path": audio.name, "source": asdict(source)}
-        _write_private(self._root / f"{source.md5}.json", json.dumps(receipt, indent=1) + "\n")
+        cached = CachedAudio(path=audio, source=source, read_path=read_path, sha256=_sha256(audio), seconds=seconds)
+        receipt = {**asdict(cached), "path": audio.name, "bytes": audio.stat().st_size,
+                   "revision_key": revision_key(source), "extraction_config": EXTRACTION_CONFIG}
+        staged = self._root / f".{key}.json.part"
+        _write_private(staged, json.dumps(receipt, indent=1) + "\n")
+        staged.replace(self._root / f"{key}.json")
         return cached
 
-    def _cached(self, source: DriveFile) -> CachedAudio | None:
-        audio, receipt = self._root / f"{source.md5}.opus", self._root / f"{source.md5}.json"
-        if not (audio.is_file() and receipt.is_file()):
-            return None
-        saved = json.loads(receipt.read_text())
-        if saved["source"]["id"] != source.id or saved["sha256"] != _sha256(audio):
+    def _cached(self, source: DriveFile, key: str) -> CachedAudio | None:
+        audio, receipt = self._root / f"{key}.opus", self._root / f"{key}.json"
+        try:
+            saved = json.loads(receipt.read_text())
+            if (saved["revision_key"] != json.loads(json.dumps(revision_key(source)))
+                    or saved["extraction_config"] != EXTRACTION_CONFIG or saved["bytes"] != audio.stat().st_size
+                    or saved["path"] != audio.name or saved["sha256"] != _sha256(audio)
+                    or not math.isfinite(saved["seconds"]) or saved["seconds"] <= 0
+                    or saved["read_path"] not in ("stream", "range")):
+                return None
+        except (OSError, ValueError, KeyError, TypeError):
             return None
         return CachedAudio(path=audio, source=source, read_path=saved["read_path"], sha256=saved["sha256"],
                            seconds=saved["seconds"])
@@ -287,11 +385,12 @@ def cut(audio: Path, start: float, seconds: float, out: Path, ffmpeg: str = "ffm
 
 
 @contextmanager
-def _ffmpeg(ffmpeg: str, inputs: list[str], out: Path) -> Iterator[subprocess.Popen]:
+def _ffmpeg(ffmpeg: str, inputs: list[str], out: Path, limit: int | None = None) -> Iterator[subprocess.Popen]:
     """Runs one ffmpeg into `out` as 16 kHz mono Opus; leaving the block waits for it and raises on failure."""
+    byte_limit = ["-fs", str(limit - 65536)] if limit is not None else []
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen([ffmpeg, "-hide_banner", "-loglevel", "error", "-xerror", "-y", *inputs, *OPUS,
-                                    str(out)],
+                                    *byte_limit, str(out)],
                                    stdin=subprocess.PIPE if "pipe:0" in inputs else subprocess.DEVNULL,
                                    stdout=subprocess.DEVNULL, stderr=errors)
         try:
@@ -299,7 +398,12 @@ def _ffmpeg(ffmpeg: str, inputs: list[str], out: Path) -> Iterator[subprocess.Po
         finally:
             if process.stdin and not process.stdin.closed:
                 _close_quietly(process.stdin)
-            code = process.wait(timeout=FFMPEG_TIMEOUT_SECONDS)
+            try:
+                code = process.wait(timeout=FFMPEG_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raise TranscodeError("ffmpeg exceeded its runtime limit") from None
         if code != 0:
             out.unlink(missing_ok=True)
             errors.seek(0)
@@ -307,11 +411,14 @@ def _ffmpeg(ffmpeg: str, inputs: list[str], out: Path) -> Iterator[subprocess.Po
 
 
 @contextmanager
-def _loopback_proxy(api: DriveApi, source: DriveFile, window: int = RANGE_WINDOW) -> Iterator[str]:
+def _loopback_proxy(api: DriveApi, source: DriveFile, window: int = RANGE_WINDOW,
+                    headroom: Callable[[int], None] | None = None) -> Iterator[str]:
     """Serves one Drive file on 127.0.0.1 with Range support, at a random path other local users cannot guess."""
     path = f"/{secrets.token_urlsafe(32)}/source.mp4"
+    failures: list[SourceError] = []
     handler = type("SourceProxy", (_ProxyHandler,), {"api": api, "source": source, "path_token": path,
-                                                     "window": window})
+                                                     "window": window, "failures": failures,
+                                                     "check_headroom": staticmethod(headroom) if headroom else None})
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -320,6 +427,8 @@ def _loopback_proxy(api: DriveApi, source: DriveFile, window: int = RANGE_WINDOW
     finally:
         server.shutdown()
         server.server_close()
+        if failures:
+            raise failures[0]
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):
@@ -327,6 +436,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     source: DriveFile
     path_token: str
     window: int
+    failures: list[SourceError]
+    check_headroom: Callable[[int], None] | None
 
     def do_GET(self) -> None:
         if not secrets.compare_digest(self.path, self.path_token):
@@ -340,7 +451,13 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self._send_head(span, partial=asked is not None)
         try:
             self._relay(*span)
-        except (SourceError, BrokenPipeError, ConnectionResetError):
+        except SourceError as exc:
+            self.failures.append(exc)
+            self.close_connection = True
+        except (http.client.IncompleteRead, TimeoutError):
+            self.failures.append(SourceError("Drive partial response disconnected or ended early"))
+            self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
 
     def _send_head(self, span: tuple[int, int], partial: bool) -> None:
@@ -357,7 +474,13 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         """Copies the span in upstream requests of at most `window` bytes each."""
         for low in range(first, last + 1, self.window):
             high = min(low + self.window, last + 1) - 1
+            if self.check_headroom is not None:
+                self.check_headroom(0)
             with self.api.media(self.source.id, f"bytes={low}-{high}") as response:
+                if response.status != 206 or response.headers.get("Content-Range") != (
+                    f"bytes {low}-{high}/{self.source.size}"
+                ):
+                    raise SourceError(f"Drive returned a mismatched Content-Range for bytes={low}-{high}")
                 body = response.read(high - low + 2)
             if len(body) != high - low + 1:
                 raise SourceError(f"Drive returned {len(body)} bytes for bytes={low}-{high}")
@@ -394,6 +517,17 @@ def _duration(ffmpeg: str, audio: Path) -> float:
     if result.returncode != 0:
         raise TranscodeError(f"ffprobe exit {result.returncode} on {audio.name}")
     return float(result.stdout.strip())
+
+
+def _decoded_duration(ffmpeg: str, audio: Path) -> float:
+    """Use the count of actual 16 kHz samples, excluding Opus priming and padding."""
+    argv = [ffmpeg, "-nostdin", "-v", "error", "-xerror", "-f", "ogg", "-i", str(audio),
+            "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"]
+    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        size = sum(len(chunk) for chunk in iter(lambda: process.stdout.read(CHUNK), b""))
+        if process.wait(timeout=120) or not size or size % 2:
+            raise TranscodeError("invalid decoded Opus sample count")
+    return size / 32000
 
 
 def _sha256(path: Path) -> str:

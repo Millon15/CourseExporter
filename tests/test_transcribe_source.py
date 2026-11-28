@@ -156,9 +156,13 @@ class DriveApiTest(unittest.TestCase):
         self.assertEqual(attempts, ["Bearer tok"] * 3)
 
     def test_refuses_a_trashed_file_and_a_permanent_error(self):
-        trashed = lambda request, timeout: Response(json.dumps({"trashed": True}).encode())
-        denied = lambda request, timeout: (_ for _ in ()).throw(
-            urllib.error.HTTPError(request.full_url, 403, "no", {}, None))
+        def trashed(request, timeout):
+            return Response(json.dumps({"trashed": True}).encode())
+
+        def denied(request, timeout):
+            raise urllib.error.HTTPError(request.full_url, 403, "no", {}, None)
+
+
         for opener in (trashed, denied):
             with self.assertRaises(source.SourceError):
                 source.DriveApi(self.Token(), opener=opener, sleep=lambda s: None).metadata("F")
@@ -191,7 +195,7 @@ class AudioCacheTest(unittest.TestCase):
         self.assertEqual((audio.read_path, api.ranges), ("stream", [None]))
         self.assertAlmostEqual(audio.seconds, 4.0, delta=0.2)
         self.assertEqual(oct(self.root.stat().st_mode & 0o777), "0o700")
-        self.assertEqual(oct((self.root / f"{audio.source.md5}.json").stat().st_mode & 0o777), "0o600")
+        self.assertEqual(oct((self.root / f"{cache._key(audio.source)}.json").stat().st_mode & 0o777), "0o600")
         self.assertEqual(cache.audio(drive_file(data), 4.0).sha256, audio.sha256)
         self.assertEqual(api.ranges, [None])
 
@@ -221,6 +225,46 @@ class AudioCacheTest(unittest.TestCase):
                 self.assertEqual((reply.status, reply.read()), (200, data))
         self.assertEqual(api.ranges[:3], ["bytes=2-4", "bytes=5-7", "bytes=8-9"])
         self.assertTrue(all(r and int(r.split("-")[1]) - int(r[6:].split("-")[0]) < 3 for r in api.ranges))
+
+    def test_refuses_partial_response_with_an_incorrect_status_or_content_range(self):
+        video = drive_file(b"01234")
+        for status, header in ((200, "bytes 0-2/5"), (206, "bytes 1-3/5"), (206, "bytes 0-2/6")):
+            with self.subTest(status=status, content_range=header):
+                handler = object.__new__(source._ProxyHandler)
+                handler.source = video
+                handler.window = 3
+                handler.check_headroom = None
+                handler.api = mock.Mock()
+                handler.api.media.return_value = Response(b"012", status, {"Content-Range": header})
+                handler.wfile = io.BytesIO()
+                with self.assertRaisesRegex(source.SourceError, "mismatched Content-Range"):
+                    handler._relay(0, 2)
+                self.assertEqual(handler.wfile.getvalue(), b"")
+
+    def test_cache_binds_revision_config_and_audio_byte_count(self):
+        data = self.video("-movflags", "+faststart")
+        api, cache = self.cache(data)
+        original = drive_file(data)
+        first = cache.audio(original, 4.0)
+        receipt_path = first.path.with_suffix(".json")
+        receipt = json.loads(receipt_path.read_text())
+        self.assertEqual(receipt["bytes"], first.path.stat().st_size)
+        self.assertEqual(receipt["extraction_config"], source.EXTRACTION_CONFIG)
+        receipt["bytes"] -= 1
+        receipt_path.write_text(json.dumps(receipt))
+        cache.audio(original, 4.0)
+        revised = drive_file(data, revision="r2")
+        api.meta = revised
+        self.assertNotEqual(cache.audio(revised, 4.0).path, first.path)
+        self.assertEqual(api.ranges, [None, None, None])
+
+    def test_stream_rechecks_revision_before_committing_cache(self):
+        data = self.video("-movflags", "+faststart")
+        api, cache = self.cache(data, revision="r2")
+        with self.assertRaisesRegex(source.SourceChanged, "after the audio read"):
+            cache.audio(drive_file(data), 4.0)
+        self.assertEqual(list(self.root.iterdir()), [])
+
 
     def test_range_header_spans(self):
         cases = {None: (0, 9), "bytes=0-": (0, 9), "bytes=3-5": (3, 5), "bytes=8-99": (8, 9), "bytes=-4": (6, 9),

@@ -55,6 +55,17 @@ class PublishedVideosTest(unittest.TestCase):
         catalog.published_videos(self.course)
         self.assertEqual(hashlib.sha256((self.course / catalog.STATE_FILE).read_bytes()).hexdigest(), before)
 
+    def test_exact_revision_must_remain_published_during_refresh(self):
+        video = catalog.published_videos(self.course)[0]
+        self.assertTrue(catalog.is_published(self.course, video))
+        with sqlite3.connect(self.course / catalog.STATE_FILE) as db:
+            db.execute("UPDATE lessons SET status='partial' WHERE lesson_id='a'")
+        self.assertFalse(catalog.is_published(self.course, video))
+        with sqlite3.connect(self.course / catalog.STATE_FILE) as db:
+            db.execute("UPDATE lessons SET status='published' WHERE lesson_id='a'")
+            db.execute("UPDATE assets SET md5='new' WHERE asset_id='v1'")
+        self.assertFalse(catalog.is_published(self.course, video))
+
     def test_missing_state_is_an_error_not_a_new_database(self):
         empty = Path(self.tmp.name) / "empty"
         empty.mkdir()

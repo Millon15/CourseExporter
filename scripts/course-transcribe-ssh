@@ -1,0 +1,6 @@
+#!/bin/sh
+# Installed as the fixed OpenSSH command for the Mac's dedicated key.
+set -eu
+umask 077
+cd /home/openclaw/repos/course-exporter
+exec /usr/bin/python3 -Es -m course_exporter.transcribe.ssh_verbs

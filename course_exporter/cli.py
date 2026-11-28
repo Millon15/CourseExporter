@@ -73,6 +73,9 @@ def _parser(settings: config.Settings) -> argparse.ArgumentParser:
     record.add_argument("--md5", required=True)
     record.add_argument("--sha256", default="")
     record.set_defaults(command=_record)
+    from .transcribe import cli as transcribe
+
+    transcribe.configure(commands.add_parser("transcribe", help="run the course transcription worker on the VPS"))
     return parser
 
 

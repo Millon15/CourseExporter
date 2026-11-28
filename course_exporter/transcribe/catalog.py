@@ -47,6 +47,20 @@ def published_videos(course_dir: Path) -> list[VideoAsset]:
     return [_asset(course_dir, row) for row in rows]
 
 
+def is_published(course_dir: Path, asset: VideoAsset) -> bool:
+    """Check the exact staged fingerprint and published status in one read transaction."""
+    with closing(_read_only(course_dir / STATE_FILE)) as db:
+        row = db.execute(PUBLISHED_VIDEOS.replace(
+            "ORDER BY l.position, a.asset_id", "AND l.lesson_id=? AND a.asset_id=?"
+        ), (asset.lesson_id, asset.asset_id)).fetchone()
+    if row is None:
+        return False
+    current = _asset(course_dir, row)
+    return (current.provider, current.course, current.lesson_dir, current.name, current.bytes, current.md5) == (
+        asset.provider, asset.course, asset.lesson_dir, asset.name, asset.bytes, asset.md5
+    )
+
+
 def _read_only(path: Path) -> sqlite3.Connection:
     if not path.is_file():
         raise FileNotFoundError(f"no exporter state at {path}")

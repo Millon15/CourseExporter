@@ -1,0 +1,18 @@
+[Unit]
+Description=Prepare course audio and publish accepted transcripts
+
+[Service]
+Type=exec
+WorkingDirectory=%h/repos/course-exporter
+ExecStart=/usr/bin/python3 -Es -m course_exporter transcribe prepare
+UMask=0077
+CPUQuota=100%
+MemoryMax=1G
+MemorySwapMax=0
+Nice=15
+IOSchedulingClass=idle
+# Runtime plus shutdown grace must fit before the 01:30 maintenance job.
+RuntimeMaxSec=29min
+TimeoutStopSec=15s
+KillMode=control-group
+NoNewPrivileges=yes
