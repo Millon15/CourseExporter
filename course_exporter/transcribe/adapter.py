@@ -5,8 +5,10 @@ Contract: UCH `src/importer/transcripts.ts` (`selectTranscript`, `readCandidate`
 - Names: `<video name without .mp4>.<md5>.` then `d2-nemotron3-parakeet3.<config8>-g<NNNN>` and `.vtt`, `.txt`,
   `.segments.json`, `.manifest.json`; the selection is `<prefix>selected.g<NNNN>.json`.
 - Times are whole milliseconds of video time, so `segments.json` and the VTT agree to the millisecond.
-- A null speaker becomes `?`. A cue that rounding leaves empty (one zero-length word) is widened by at most 0.2 s,
-  never past the next cue's start or the video's end; one still empty refuses the whole item.
+- A null speaker becomes `?`. A cue that rounding leaves empty (one zero-length word) joins the next cue when that
+  starts at the same millisecond, taking its span and speaker; otherwise it widens by at most 0.2 s, never past the
+  next cue's start or the video's end. One still empty refuses the whole item. v13 decision 8 refused every empty
+  cue; this repair keeps the text (bench ru-dialogue 857.76 s: "То" + "есть, типа.").
 - Pure: no I/O and no Drive; the publisher names, uploads and selects.
 """
 
@@ -15,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from . import d2_pins as pins
@@ -112,8 +114,7 @@ def selection_pattern(video: Video) -> re.Pattern[str]:
 def _cues(doc: dict[str, Any], video: Video) -> list[Cue]:
     offset_ms = round(doc["source"]["offset_s"] * 1000)
     limit_ms = int(video.duration_s * 1000) + END_SLACK_MS
-    raw = [_cue(segment, offset_ms) for segment in doc["segments"]]
-    cues = [_widened(cue, raw[index + 1:index + 2], limit_ms) for index, cue in enumerate(raw)]
+    cues = _repaired([_cue(segment, offset_ms) for segment in doc["segments"]], limit_ms)
     for index, cue in enumerate(cues):
         _require(cue.end_ms > cue.start_ms, f"cue {index} at {cue.start_ms} ms is empty after millisecond rounding")
         _require(cue.end_ms <= limit_ms, f"cue {index} ends at {cue.end_ms} ms, after the video ({limit_ms} ms)")
@@ -129,11 +130,27 @@ def _cue(segment: dict[str, Any], offset_ms: int) -> Cue:
     return Cue(offset_ms + round(segment["start"] * 1000), offset_ms + round(segment["end"] * 1000), speaker, text)
 
 
+def _repaired(raw: list[Cue], limit_ms: int) -> list[Cue]:
+    repaired: list[Cue] = []
+    carried = ""
+    for index, cue in enumerate(raw):
+        cue = replace(cue, text=f"{carried} {cue.text}") if carried else cue
+        following = raw[index + 1:index + 2]
+        carried = cue.text if _joins_next(cue, following) else ""
+        if not carried:
+            repaired.append(_widened(cue, following, limit_ms))
+    return repaired
+
+
+def _joins_next(cue: Cue, following: list[Cue]) -> bool:
+    return cue.end_ms <= cue.start_ms and bool(following) and following[0].start_ms == cue.start_ms
+
+
 def _widened(cue: Cue, following: list[Cue], limit_ms: int) -> Cue:
     if cue.end_ms > cue.start_ms:
         return cue
     bounds = [cue.start_ms + WIDEN_MS, limit_ms]
-    bounds += [after.start_ms for after in following if after.start_ms > cue.start_ms]
+    bounds += [after.start_ms for after in following]
     return Cue(cue.start_ms, min(bounds), cue.speaker, cue.text)
 
 

@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 import tempfile
@@ -31,6 +32,13 @@ def result_doc(audio, language, job_id):
         "run": {"run_id": "r", "host": "h", "warm": False, "peak_rss_mb": None, "stages_s": {"total": 1.0},
                 "request_ids": [], "usage": None, "cost_usd": None},
     }
+
+
+def result_doc_bytes():
+    with tempfile.NamedTemporaryFile() as handle:
+        handle.write(AUDIO)
+        handle.flush()
+        return result_doc(handle.name, "uk", "job-1")
 
 
 class FakeRemote:
@@ -143,6 +151,13 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(remote.submitted, [("L1", kept)])
         self.assertFalse(self.scratch.result.exists())
 
+    def test_once_counts_a_recovered_receipt_as_its_item(self):
+        self.scratch.write(self.scratch.lease, json.dumps(lease_json()).encode())
+        self.scratch.write(self.scratch.result, json.dumps(result_doc_bytes()).encode())
+        remote = FakeRemote()
+        self.worker(remote).run(once=True)
+        self.assertEqual(remote.calls, ["submit"])
+
     def test_drops_a_kept_result_the_vps_refuses(self):
         self.scratch.write(self.scratch.lease, json.dumps(lease_json()).encode())
         self.scratch.write(self.scratch.result, b"{}")
@@ -199,6 +214,9 @@ class RemoteTest(unittest.TestCase):
         remote.submit("L1", b"{}")
         self.assertEqual(seen[0][0][-3:], ["jarvis-transcribe", "renew", "L1"])
         self.assertIn("BatchMode=yes", seen[0][0])
+        self.assertEqual(seen[0][0][1:3], ["-F", str(mac_worker.SSH_CONFIG)])
+        self.assertIn("ControlMaster=no", seen[0][0])
+        self.assertIn("ControlPath=none", seen[0][0])
         self.assertEqual(seen[1], (seen[1][0], b"{}"))
         self.assertEqual(seen[1][0][-2:], ["submit", "L1"])
 
@@ -209,7 +227,105 @@ class RemoteTest(unittest.TestCase):
         self.assertIsNone(mac_worker.Remote(run=run).lease())
 
 
+class FakeProcess:
+    def __init__(self, data):
+        self.stdout, self.stderr = io.BytesIO(data), io.BytesIO(b"")
+        self.returncode = 0
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class RemoteAudioTest(unittest.TestCase):
+    def test_stops_before_writing_past_the_lease_size(self):
+        process = FakeProcess(AUDIO + b"x" * (mac_worker.CHUNK + 1))
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "item.opus.part"
+            remote = mac_worker.Remote(popen=lambda *a, **k: process)
+            with self.assertRaises(RemoteError):
+                remote.audio(Lease.parse(lease_json()), target)
+            self.assertTrue(process.killed)
+            self.assertLessEqual(target.stat().st_size, len(AUDIO))
+
+    def test_refuses_to_write_through_a_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = Path(tmp) / "outside"
+            outside.write_bytes(b"keep")
+            link = Path(tmp) / "item.opus.part"
+            link.symlink_to(outside)
+            remote = mac_worker.Remote(popen=lambda *a, **k: FakeProcess(AUDIO))
+            with self.assertRaises(OSError):
+                remote.audio(Lease.parse(lease_json()), link)
+            self.assertEqual(outside.read_bytes(), b"keep")
+
+
+class IdentityTest(unittest.TestCase):
+    """Runs the real `ssh -G`, which resolves the config without touching the network."""
+
+    def check(self, extra=""):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config"
+            config.write_text(f"Host jarvis-transcribe\n  HostName 127.0.0.1\n  User openclaw\n"
+                              f"  IdentityFile {tmp}/restricted\n  IdentitiesOnly yes\n  IdentityAgent none\n{extra}")
+            mac_worker.Remote("jarvis-transcribe", config).check_identity()
+
+    def test_accepts_exactly_the_restricted_identity(self):
+        self.check()
+
+    def test_refuses_a_wildcard_identity_or_an_agent(self):
+        for extra in (f"Host *\n  IdentityFile ~/.ssh/operator\n", "Host *\n  IdentityAgent /tmp/agent.sock\n"):
+            with self.subTest(extra), self.assertRaises(ValueError):
+                with tempfile.TemporaryDirectory() as tmp:
+                    config = Path(tmp) / "config"
+                    config.write_text(f"Host jarvis-transcribe\n  HostName 127.0.0.1\n  IdentityFile {tmp}/r\n"
+                                      f"  IdentitiesOnly yes\n{extra}")
+                    mac_worker.Remote("jarvis-transcribe", config).check_identity()
+
+    def test_refuses_a_config_without_an_identity_file(self):
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            config = Path(tmp) / "config"
+            config.write_text("Host jarvis-transcribe\n  HostName 127.0.0.1\n  IdentitiesOnly yes\n  IdentityAgent none\n")
+            mac_worker.Remote("jarvis-transcribe", config).check_identity()
+
+
 class ScratchTest(unittest.TestCase):
+    def test_refuses_a_foreign_entry_or_a_link(self):
+        for name, make in (("notes.txt", lambda p: p.write_text("x")),
+                           ("item.result.json.tmp", lambda p: p.symlink_to("/etc/hosts"))):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                scratch = Scratch(Path(tmp) / "scratch")
+                scratch.open()
+                make(scratch.root / name)
+                with self.assertRaises(ValueError):
+                    scratch.open()
+
+    def test_a_link_planted_after_open_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = Path(tmp) / "outside"
+            outside.write_bytes(b"keep")
+            scratch = Scratch(Path(tmp) / "scratch")
+            scratch.open()
+            (scratch.root / "item.result.json.tmp").symlink_to(outside)
+            with self.assertRaises(OSError):
+                scratch.write(scratch.result, b"{}")
+            self.assertEqual(outside.read_bytes(), b"keep")
+
+    def test_clear_removes_only_its_own_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Scratch(Path(tmp) / "scratch")
+            scratch.open()
+            scratch.write(scratch.result, b"{}")
+            scratch.write(scratch.audio, AUDIO)
+            scratch.clear()
+            self.assertEqual(sorted(p.name for p in scratch.root.iterdir()), [])
+
     def test_refuses_a_directory_other_users_can_open(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "scratch"

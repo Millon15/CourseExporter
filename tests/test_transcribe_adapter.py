@@ -71,6 +71,15 @@ class RenderTest(unittest.TestCase):
         self.assertEqual([(s["start"], s["end"]) for s in payload["segments"]], [(1.0, 1.05), (1.05, 2.0),
                                                                                 (3.0, 3.2)])
 
+    def test_an_empty_cue_joins_a_next_cue_at_the_same_millisecond(self):
+        doc = document(cue(857.28, 857.76, None, "гнезно."), cue(857.76, 857.76, None, "То"),
+                       cue(857.76, 859.68, "S1", "есть, типа."))
+        video = adapter.Video("a.mp4", "id", MD5, 900.0)
+        payload = json.loads({f.role: f for f in adapter.render(doc, video, 1, {})}["segments"].data)
+        self.assertEqual(payload["segments"], [
+            {"start": 857.28, "end": 857.76, "speaker": "?", "text": "гнезно."},
+            {"start": 857.76, "end": 859.68, "speaker": "S1", "text": "То есть, типа."}])
+
     def test_refuses_what_uch_would_drop(self):
         long_speaker = document()
         long_speaker["segments"][0]["speaker"] = "S" * 129

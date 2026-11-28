@@ -33,6 +33,7 @@ from . import d2_pins as pins
 from . import segments
 
 HOST = "jarvis-transcribe"
+SSH_CONFIG = Path.home() / ".ssh" / "course-transcribe.config"
 SCRATCH = Path.home() / "Library" / "Caches" / "course-transcribe"
 RENEW_EVERY_S = 120
 PREPARING_POLL_S = 30
@@ -50,6 +51,7 @@ EXIT_MODELS_MISSING = 3
 EXIT_BUSY = 75
 LEASE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
+PRIVATE_WRITE = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
 
 Transcriber = Callable[[Path, str, str], dict[str, Any]]
 
@@ -88,13 +90,30 @@ class Lease:
 
 
 class Remote:
-    """The six VPS verbs over the restricted ssh alias; nothing else reaches the VPS."""
+    """The six VPS verbs over the restricted key only.
 
-    def __init__(self, host: str = HOST, run: Callable[..., Any] = subprocess.run,
+    ssh reads the worker's own config file (`-F`), never `~/.ssh/config`, so no wildcard `IdentityFile`, agent or
+    shared ControlMaster socket can offer the operator's login; `check_identity` proves that before any call.
+    """
+
+    def __init__(self, host: str = HOST, config: Path = SSH_CONFIG, run: Callable[..., Any] = subprocess.run,
                  popen: Callable[..., Any] = subprocess.Popen) -> None:
         self._host = host
+        self._config = config
         self._run = run
         self._popen = popen
+
+    def check_identity(self) -> None:
+        """Refuses an effective ssh config that could offer any key but the one restricted identity."""
+        shown = self._run(["ssh", "-G", "-F", str(self._config), self._host], input=b"", capture_output=True,
+                          check=False)
+        _require(shown.returncode == 0, f"ssh -G -F {self._config} failed: {shown.stderr.decode(errors='replace')}")
+        settings = [line.split(" ", 1) for line in shown.stdout.decode().splitlines() if " " in line]
+        identities = [value for key, value in settings if key == "identityfile"]
+        effective = dict(settings)
+        _require(len(identities) == 1, f"{self._host} offers {len(identities)} identity files, not exactly one")
+        _require(effective.get("identitiesonly") == "yes", f"{self._host} lacks IdentitiesOnly yes")
+        _require(effective.get("identityagent") == "none", f"{self._host} may use an ssh agent")
 
     def request(self) -> dict[str, Any]:
         return json.loads(self._call("request"))
@@ -114,11 +133,17 @@ class Remote:
         return json.loads(self._call("submit", lease_id, data))
 
     def audio(self, lease: Lease, target: Path) -> str:
-        """Streams the Opus into `target` and returns its SHA-256."""
+        """Streams the Opus into `target` and returns its SHA-256; stops before writing past the lease's size."""
         digest = hashlib.sha256()
-        with target.open("wb") as out, self._popen(self._argv("audio", lease.lease_id), stdout=subprocess.PIPE,
-                                                    stderr=subprocess.PIPE, stdin=subprocess.DEVNULL) as process:
+        written = 0
+        with os.fdopen(os.open(target, PRIVATE_WRITE, 0o600), "wb") as out, \
+                self._popen(self._argv("audio", lease.lease_id), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL) as process:
             for chunk in iter(lambda: process.stdout.read(CHUNK), b""):
+                written += len(chunk)
+                if written > lease.audio_bytes:
+                    process.kill()
+                    raise RemoteError("audio", EXIT_FAILED, f"the stream passed the lease's {lease.audio_bytes} bytes")
                 digest.update(chunk)
                 out.write(chunk)
             detail = process.stderr.read().decode(errors="replace").strip()
@@ -133,12 +158,13 @@ class Remote:
         return result.stdout
 
     def _argv(self, verb: str, argument: str | None) -> list[str]:
-        options = ["-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"]
+        options = ["-F", str(self._config), "-o", "BatchMode=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                   "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"]
         return ["ssh", *options, self._host, verb, *([argument] if argument else [])]
 
 
 class Scratch:
-    """The one-item scratch directory: fixed names, 0700, owned by this user."""
+    """The one-item scratch directory: fixed names, 0700, owned by this user, regular files only, no links."""
 
     def __init__(self, root: Path = SCRATCH) -> None:
         self.root = root
@@ -146,16 +172,24 @@ class Scratch:
         self.partial = root / "item.opus.part"
         self.result = root / "item.result.json"
         self.lease = root / "item.lease.json"
+        self._items = (self.audio, self.partial, self.result, self.lease)
 
     def open(self) -> None:
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.root.lstat()
         _require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid(), f"{self.root} is not my directory")
         _require(info.st_mode & 0o077 == 0, f"{self.root} is open to other users")
+        self._refuse_foreign_entries()
+
+    def _refuse_foreign_entries(self) -> None:
+        known = {".lock", *(p.name for p in self._items), *(p.name + ".tmp" for p in self._items)}
+        for entry in self.root.iterdir():
+            _require(entry.name in known, f"{entry} is not a worker file; move it out of {self.root}")
+            _require(stat.S_ISREG(entry.lstat().st_mode), f"{entry} is not a regular file")
 
     @contextmanager
     def locked(self) -> Generator[bool]:
-        with (self.root / ".lock").open("w") as handle:
+        with os.fdopen(os.open(self.root / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600), "w") as handle:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -164,17 +198,16 @@ class Scratch:
             yield True
 
     def holds_audio(self, sha256: str) -> bool:
-        return self.audio.is_file() and _file_sha256(self.audio) == sha256
+        return _is_regular(self.audio) and _file_sha256(self.audio) == sha256
 
     def write(self, path: Path, data: bytes) -> None:
         partial = path.with_name(path.name + ".tmp")
-        fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as handle:
+        with os.fdopen(os.open(partial, PRIVATE_WRITE, 0o600), "wb") as handle:
             handle.write(data)
         partial.replace(path)
 
     def clear(self) -> None:
-        for path in (self.audio, self.partial, self.result, self.lease):
+        for path in self._items:
             path.unlink(missing_ok=True)
 
 
@@ -190,16 +223,18 @@ class Worker:
         self._renew_every = renew_every
 
     def run(self, once: bool = False) -> int:
-        self._resubmit_pending()
+        if self._resubmit_pending() and once:
+            return EXIT_OK
         while (lease := self._next_lease()) is not None:
             self._process(lease)
             if once:
                 break
         return EXIT_OK
 
-    def _resubmit_pending(self) -> None:
-        if not (self._scratch.result.is_file() and self._scratch.lease.is_file()):
-            return
+    def _resubmit_pending(self) -> bool:
+        """True when a kept result got its receipt: that was this run's item."""
+        if not (_is_regular(self._scratch.result) and _is_regular(self._scratch.lease)):
+            return False
         lease = Lease.parse(json.loads(self._scratch.lease.read_bytes()))
         self._log(f"resubmitting the kept result of job {lease.job_id}")
         try:
@@ -209,6 +244,8 @@ class Worker:
                 raise
             self._log(f"the VPS refused the kept result ({error}); dropping it")
             self._scratch.clear()
+            return False
+        return True
 
     def _next_lease(self) -> Lease | None:
         waited = 0.0
@@ -314,6 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Transcribe prepared course audio from the VPS with D2")
     parser.add_argument("--once", action="store_true", help="stop after one item")
     parser.add_argument("--host", default=HOST, help="ssh alias of the restricted VPS key")
+    parser.add_argument("--ssh-config", type=Path, default=SSH_CONFIG, help="the worker's own ssh config file")
     parser.add_argument("--scratch", type=Path, default=SCRATCH)
     args = parser.parse_args(argv)
     scratch = Scratch(args.scratch)
@@ -322,7 +360,9 @@ def main(argv: list[str] | None = None) -> int:
         if not acquired:
             print(f"another worker holds {scratch.root / '.lock'}", file=sys.stderr)
             return EXIT_BUSY
-        return _run(Worker(Remote(args.host), scratch, LazyD2(), log=_log), args.once)
+        remote = Remote(args.host, args.ssh_config)
+        remote.check_identity()
+        return _run(Worker(remote, scratch, LazyD2(), log=_log), args.once)
 
 
 def _run(worker: Worker, once: bool) -> int:
@@ -340,6 +380,13 @@ def _run(worker: Worker, once: bool) -> int:
 
 def _log(line: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line}", flush=True)
+
+
+def _is_regular(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except FileNotFoundError:
+        return False
 
 
 def _file_sha256(path: Path) -> str:

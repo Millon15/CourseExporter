@@ -36,36 +36,41 @@ Every published course video gets a transcript that UniversalCourseHost reads be
    ssh-keygen -t ed25519 -f ~/.ssh/jarvis_transcribe_ed25519 -C course-transcribe
    ```
 
-3. Add the alias to `~/.ssh/config`, with the same `HostName`, `Port` and `ProxyCommand` as the operator's own VPS
-   alias:
+3. Write the worker's own ssh config, `~/.ssh/course-transcribe.config` (0600), with the `HostName`, `Port` and
+   `ProxyCommand` of the operator's VPS alias. The worker runs `ssh -F` with this file only, so `~/.ssh/config`,
+   its wildcard `IdentityFile` lines, an agent or a shared ControlMaster socket can never offer the operator's
+   login. The worker checks `ssh -G` before every run and refuses anything but exactly one identity:
 
    ```text
    Host jarvis-transcribe
      User openclaw
      IdentityFile ~/.ssh/jarvis_transcribe_ed25519
      IdentitiesOnly yes
+     IdentityAgent none
+     ControlMaster no
+     ControlPath none
    ```
-
-   `IdentitiesOnly yes` keeps the worker off every other key, so it can never reach the operator's login.
 
 ## Run
 
 ```sh
 uv run --frozen --project tools/transcribe-d2 python -m course_exporter.transcribe.mac_worker          # until the queue is empty
 uv run --frozen --project tools/transcribe-d2 python -m course_exporter.transcribe.mac_worker --once   # one item
-ssh jarvis-transcribe status                                                                           # journal counts
+ssh -F ~/.ssh/course-transcribe.config jarvis-transcribe status                                       # journal counts
 ```
 
 | Exit | Meaning |
 | --- | --- |
 | 0 | the queue is empty or deferred (maintenance window, fleet lock, staging floor) |
-| 1 | an item stopped: audio mismatch, lease fenced, result refused; the reason is on stderr |
+| 1 | an item stopped (audio mismatch or oversize, lease fenced, result refused) or the ssh config offers more than the restricted key; the reason is on stderr |
 | 3 | a pinned model is missing: run `--fetch` |
 | 75 | another worker holds `~/Library/Caches/course-transcribe/.lock` |
 
 Scratch is `~/Library/Caches/course-transcribe/` (0700). It holds one item at most: `item.opus` (about 4 MB per
 audio hour), `item.lease.json` and `item.result.json`. The worker deletes them after the VPS confirms the receipt.
-A result whose submit reply was lost stays there and goes out again, unchanged, on the next start.
+A result whose submit reply was lost stays there and goes out again, unchanged, on the next start;
+with `--once` that recovered receipt is the run's one item. The worker refuses a scratch directory holding
+anything but its own regular files, and never follows a link there.
 
 ## Hourly on the Mac (opt-in)
 
