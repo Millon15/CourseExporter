@@ -195,6 +195,35 @@ class GetCourseTests(unittest.TestCase):
         browser = FixtureBrowser({LESSON: {"html": "<p>Lesson</p>\n<h3>Задание</h3><p>Task</p>"}})
         self.assertIn("<h3>Задание</h3><p>Task</p>", self.provider.extract(browser, self.ref).html)
 
+    def test_embedded_players_get_their_own_ids_and_resolve_to_their_stream(self):
+        kinescope = "https://kinescope.io/embed/vhvG73Gj6wxtkNfdYm9U6z"
+        youtube = "https://www.youtube.com/embed/abcdefghijk"
+        master = "https://kinescope.io/2e6f05fa-fb96-4edd-a8bd-8ea381a88442/master.m3u8"
+        browser = FixtureBrowser({LESSON: {
+            "html": '<video src="asset:video-1"></video><video src="asset:video-embed-1"></video>'
+                    '<video src="asset:video-embed-2"></video>',
+            "frames": [{"url": PLAYER}],
+            "embeds": [{"title": "Эфир", "url": kinescope}, {"title": "Clip", "url": youtube}],
+        }})
+        lesson = self.provider.extract(browser, self.ref)
+        self.assertEqual([asset.asset_id for asset in lesson.assets], ["video-1", "video-embed-1", "video-embed-2"])
+        page = f'<script>var p = {{"duration":4827.6,"hls":{{"src":"{master}"}},"drm":null}};</script>'
+        with patch(FETCH_PLAYER, return_value=page) as fetched:
+            media = self.provider.resolve(browser, self.ref, lesson.assets[1])
+        self.assertEqual(fetched.call_args.args[0], kinescope)
+        self.assertEqual((media.kind, media.url, media.headers, media.expected_seconds),
+                         ("hls", master, {"Referer": "https://kinescope.io/"}, 4827.6))
+        media = self.provider.resolve(browser, self.ref, lesson.assets[2])
+        self.assertEqual((media.kind, media.url), ("hls", youtube))
+
+    def test_a_kinescope_player_with_drm_or_without_a_playlist_is_unsupported(self):
+        browser = FixtureBrowser({LESSON: {"html": "", "embeds": [{"url": "https://kinescope.io/embed/abc"}]}})
+        asset = self.provider.extract(browser, self.ref).assets[0]
+        for page, reason in (('{"drm":{"widevine":{"licenseUrl":"x"}}}', "DRM"), ("<html></html>", "no HLS")):
+            with self.subTest(reason=reason), patch(FETCH_PLAYER, return_value=page):
+                with self.assertRaisesRegex(UnsupportedMedia, reason):
+                    self.provider.resolve(browser, self.ref, asset)
+
     def test_gated_lesson_has_no_assets(self):
         browser = FixtureBrowser({LESSON: {"gated": True, "frames": [{"url": PLAYER}]}})
         lesson = self.provider.extract(browser, self.ref)

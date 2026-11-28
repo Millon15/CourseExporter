@@ -89,6 +89,11 @@ _DISCOVER = r"""(page, absolute) => {
 }"""
 
 
+_KINESCOPE_MASTER = re.compile(r"https://kinescope\.io/[0-9a-f-]{36}/master\.m3u8")
+_KINESCOPE_DURATION = re.compile(r'"duration"\s*:\s*([0-9]+(?:\.[0-9]+)?)')
+_KINESCOPE_DRM = re.compile(r'"(?:drm|widevine|fairplay|playready)"\s*:\s*(?!null|false|\{\s*\}|\[\s*\])', re.I)
+"""A DRM block with any content means a protected video; it is never fetched."""
+
 _LESSON = r"""(page, absolute) => {
     const content = '.lesson-content, .lesson-description, .lesson-text, .lesson-blocks, .lt-lesson';
     const excluded = [
@@ -99,7 +104,8 @@ _LESSON = r"""(page, absolute) => {
     ].join(', ');
     const mission = '.lesson-mission-text';
     const answers = '.self-answers, .other-answers, .answer_wrapper, .lesson-send-answer-block, .comments, .gc-comment';
-    const frames = [], videos = [], assets = [], markup = [], outsidePlayers = [];
+    const frames = [], videos = [], embeds = [], assets = [], markup = [], outsidePlayers = [];
+    const embedHost = /(^|\.)(kinescope\.io|youtube(-nocookie)?\.com|youtu\.be|vk\.(com|ru)|vkvideo\.ru|vimeo\.com)$/;
     const seen = new Map();
     const counts = {image: 0, file: 0};
     const add = (kind, url, label) => {
@@ -125,7 +131,15 @@ _LESSON = r"""(page, absolute) => {
             || absolute(iframe?.getAttribute('src')) || absolute(iframe?.getAttribute('data-src'));
         const videoBlock = element.closest('.lt-video, .lesson-video, .video-player')
             || element.matches('iframe.vhi-iframe, iframe.js--vhi-iframe');
-        if (!root && !videoBlock && !(url && /^\/sign-player(?:\/|$)/.test(new URL(url).pathname))) continue;
+        if (!root && !videoBlock && !(url && /^\/sign-player(?:\/|$)/.test(new URL(url).pathname))) {
+            if (!url || !embedHost.test(new URL(url).hostname)) continue;
+            const label = iframe?.title || 'Video ' + (embeds.length + 1);
+            const insideContent = !!element.closest(content);
+            embeds.push({title: label, url});
+            const placeholder = videoPlaceholder(element, 'video-embed-' + embeds.length, label);
+            if (!insideContent) outsidePlayers.push(placeholder.outerHTML);
+            continue;
+        }
         const index = frames.length + 1;
         const label = iframe?.title || 'Video ' + index;
         const insideContent = !!element.closest(content);
@@ -181,7 +195,7 @@ _LESSON = r"""(page, absolute) => {
         login: !!page.querySelector('form[action*="/login"], form.state-login'),
         gated: !!page.querySelector('.lesson-access-denied, .lesson-not-available, .lesson-locked'),
         html: [...markup, ...outsidePlayers].join('\n'),
-        frames, videos, assets,
+        frames, videos, embeds, assets,
     };
 }"""
 
@@ -356,7 +370,8 @@ def _link_title(value: Any, kind: str, page_id: str) -> str:
 
 def _asset_rows(page: dict[str, Any]) -> list[tuple[Asset, dict[str, Any]]]:
     assets = []
-    for key, prefix, kind in (("frames", "video", "video"), ("videos", "video-direct", "video")):
+    for key, prefix, kind in (("frames", "video", "video"), ("videos", "video-direct", "video"),
+                              ("embeds", "video-embed", "video")):
         for index, row in enumerate(_rows(page, key), 1):
             asset_id = f"{prefix}-{index}"
             assets.append((Asset(asset_id, kind, _label(row.get("title"), f"Video {index}"), asset_id), row))
@@ -370,6 +385,28 @@ def _asset_rows(page: dict[str, Any]) -> list[tuple[Asset, dict[str, Any]]]:
         asset_id = f"{kind}-{counts[kind]}"
         assets.append((Asset(asset_id, kind, _label(row.get("title"), kind.capitalize()), asset_id), row))
     return assets
+
+
+def _embedded_media(row: dict[str, Any], ref: LessonRef) -> Media:
+    """A third-party player: Kinescope yields its HLS master playlist, the rest go to yt-dlp as they are."""
+    url = _https_url(row.get("url"))
+    if url is None:
+        raise UnsupportedMedia("GetCourse embedded player URL is unavailable")
+    if (urlsplit(url).hostname or "").endswith("kinescope.io"):
+        return _kinescope_media(url, ref)
+    return Media("hls", url, {"Referer": f"https://{urlsplit(ref.url).netloc}/"})
+
+
+def _kinescope_media(url: str, ref: LessonRef) -> Media:
+    page = fetch_public_text(url, {"Referer": f"https://{urlsplit(ref.url).netloc}/"})
+    if _KINESCOPE_DRM.search(page):
+        raise UnsupportedMedia("Kinescope player advertises DRM")
+    master = _KINESCOPE_MASTER.search(page)
+    if master is None:
+        raise UnsupportedMedia("Kinescope player exposes no HLS playlist")
+    duration = _KINESCOPE_DURATION.search(page)
+    return Media("hls", master[0], {"Referer": "https://kinescope.io/"},
+                 expected_seconds=float(duration[1]) if duration else None)
 
 
 def _signed_player(url: str) -> bool:
@@ -461,6 +498,9 @@ class GetCourseProvider:
                 if url:
                     return Media("file", url, {"Referer": ref.url})
                 raise UnsupportedMedia("GetCourse attachment URL is unavailable")
+
+            if current.ref.startswith("video-embed-"):
+                return _embedded_media(row, ref)
 
             if current.ref.startswith("video-direct-"):
                 for source in _rows(row, "sources") or [row]:
