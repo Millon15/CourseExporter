@@ -133,15 +133,18 @@ def run(journal: Journal, cache: AudioCache, publisher: Publisher, admit: Callab
                     if publisher.already_compliant(job):
                         journal.mark(job.id, "preparing", "already compliant", "verified selection on Drive")
                         continue
+                    expected_seconds = job.asset.duration
+                    if expected_seconds <= 0:
+                        expected_seconds = job.source.video_seconds or 0.0
                     try:
-                        audio = cache.audio(job.source, job.asset.duration)
+                        audio = cache.audio(job.source, expected_seconds)
                     except LowSpace:
                         live = journal.report(scoped=False)
                         active_sources = {row.source for row in live if row.state not in TERMINAL}
                         for row in live:
                             if row.state in TERMINAL and row.source not in active_sources:
                                 cache.discard(row.source)
-                        audio = cache.audio(job.source, job.asset.duration)
+                        audio = cache.audio(job.source, expected_seconds)
                     publisher.current(job)
                     journal.ready(job.id, audio)
                     return

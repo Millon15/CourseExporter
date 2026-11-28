@@ -1,12 +1,14 @@
 import fcntl
 import tempfile
 import unittest
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
 from course_exporter.transcribe import prepare
-from course_exporter.transcribe.source import LowSpace
+from course_exporter.transcribe.source import AudioCache, LowSpace
+from tests.test_transcribe_source import asset, drive_file
 
 
 class MaintenanceTest(unittest.TestCase):
@@ -50,3 +52,40 @@ class MaintenanceTest(unittest.TestCase):
                 with self.assertRaises(LowSpace):
                     prepare.check_headroom(root, root / "cache", 1)
             self.assertFalse((root / ".reservations").exists())
+
+
+class DurationTest(unittest.TestCase):
+    def test_preparation_uses_exporter_duration_first_then_pinned_drive_duration(self):
+        cases = ((12.3, 13.0, 12.3), (0.0, 1198.33, 1198.33), (0.0, 740.599, 740.599))
+        for exporter_seconds, drive_seconds, expected in cases:
+            with self.subTest(exporter_seconds=exporter_seconds, drive_seconds=drive_seconds), \
+                    tempfile.TemporaryDirectory() as directory:
+                job, journal, publisher = self.preparation(Path(directory), exporter_seconds, drive_seconds)
+                cache = mock.Mock()
+                audio = mock.sentinel.cached_audio
+                cache.audio.side_effect = [LowSpace("cache is full"), audio]
+                prepare.run(journal, cache, publisher, nullcontext)
+                self.assertEqual(cache.audio.call_args_list, [mock.call(job.source, expected)] * 2)
+                journal.ready.assert_called_once_with(job.id, audio)
+
+    def test_preparation_fails_if_neither_duration_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job, journal, publisher = self.preparation(root, 0.0, None)
+            cache = AudioCache(root / "cache", mock.Mock())
+            prepare.run(journal, cache, publisher, nullcontext)
+            journal.mark.assert_called_once_with(job.id, "preparing", "failed",
+                                                 "preparation: missing verified video duration")
+            journal.ready.assert_not_called()
+
+    @staticmethod
+    def preparation(root, exporter_seconds, drive_seconds):
+        job = mock.Mock(id="job", asset=asset(duration=exporter_seconds),
+                        source=drive_file(video_seconds=drive_seconds))
+        journal = mock.Mock(path=root / "journal.sqlite3")
+        journal.next_publish.return_value = None
+        journal.next_prepare.side_effect = [job, None]
+        journal.report.return_value = []
+        publisher = mock.Mock()
+        publisher.already_compliant.return_value = False
+        return job, journal, publisher
