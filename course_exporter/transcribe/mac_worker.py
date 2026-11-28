@@ -34,6 +34,7 @@ from . import segments
 
 HOST = "jarvis-transcribe"
 SSH_CONFIG = Path.home() / ".ssh" / "course-transcribe.config"
+SSH_KEY = Path.home() / ".ssh" / "jarvis_transcribe_ed25519"
 SCRATCH = Path.home() / "Library" / "Caches" / "course-transcribe"
 RENEW_EVERY_S = 120
 PREPARING_POLL_S = 30
@@ -51,7 +52,7 @@ EXIT_MODELS_MISSING = 3
 EXIT_BUSY = 75
 LEASE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
-PRIVATE_WRITE = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+NEW_PRIVATE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 
 Transcriber = Callable[[Path, str, str], dict[str, Any]]
 
@@ -96,10 +97,11 @@ class Remote:
     shared ControlMaster socket can offer the operator's login; `check_identity` proves that before any call.
     """
 
-    def __init__(self, host: str = HOST, config: Path = SSH_CONFIG, run: Callable[..., Any] = subprocess.run,
-                 popen: Callable[..., Any] = subprocess.Popen) -> None:
+    def __init__(self, host: str = HOST, config: Path = SSH_CONFIG, key: Path = SSH_KEY,
+                 run: Callable[..., Any] = subprocess.run, popen: Callable[..., Any] = subprocess.Popen) -> None:
         self._host = host
         self._config = config
+        self._key = key
         self._run = run
         self._popen = popen
 
@@ -112,6 +114,8 @@ class Remote:
         identities = [value for key, value in settings if key == "identityfile"]
         effective = dict(settings)
         _require(len(identities) == 1, f"{self._host} offers {len(identities)} identity files, not exactly one")
+        _require(os.path.expanduser(identities[0]) == str(self._key), f"{self._host} offers {identities[0]}, "
+                 f"not the restricted key {self._key}")
         _require(effective.get("identitiesonly") == "yes", f"{self._host} lacks IdentitiesOnly yes")
         _require(effective.get("identityagent") == "none", f"{self._host} may use an ssh agent")
 
@@ -136,7 +140,7 @@ class Remote:
         """Streams the Opus into `target` and returns its SHA-256; stops before writing past the lease's size."""
         digest = hashlib.sha256()
         written = 0
-        with os.fdopen(os.open(target, PRIVATE_WRITE, 0o600), "wb") as out, \
+        with os.fdopen(_create_private(target), "wb") as out, \
                 self._popen(self._argv("audio", lease.lease_id), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             stdin=subprocess.DEVNULL) as process:
             for chunk in iter(lambda: process.stdout.read(CHUNK), b""):
@@ -185,11 +189,13 @@ class Scratch:
         known = {".lock", *(p.name for p in self._items), *(p.name + ".tmp" for p in self._items)}
         for entry in self.root.iterdir():
             _require(entry.name in known, f"{entry} is not a worker file; move it out of {self.root}")
-            _require(stat.S_ISREG(entry.lstat().st_mode), f"{entry} is not a regular file")
+            _require_private(entry.lstat(), entry)
 
     @contextmanager
     def locked(self) -> Generator[bool]:
-        with os.fdopen(os.open(self.root / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600), "w") as handle:
+        lock = self.root / ".lock"
+        with os.fdopen(os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600), "w") as handle:
+            _require_private(os.fstat(handle.fileno()), lock)
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -202,7 +208,7 @@ class Scratch:
 
     def write(self, path: Path, data: bytes) -> None:
         partial = path.with_name(path.name + ".tmp")
-        with os.fdopen(os.open(partial, PRIVATE_WRITE, 0o600), "wb") as handle:
+        with os.fdopen(_create_private(partial), "wb") as handle:
             handle.write(data)
         partial.replace(path)
 
@@ -380,6 +386,19 @@ def _run(worker: Worker, once: bool) -> int:
 
 def _log(line: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line}", flush=True)
+
+
+def _create_private(path: Path) -> int:
+    """A new 0600 file under a fixed name: the old name is unlinked first, so a planted hard link or symlink keeps
+    its target untouched, and O_EXCL|O_NOFOLLOW refuses anything that reappears in between."""
+    path.unlink(missing_ok=True)
+    return os.open(path, NEW_PRIVATE, 0o600)
+
+
+def _require_private(info: os.stat_result, path: Path) -> None:
+    _require(stat.S_ISREG(info.st_mode), f"{path} is not a regular file")
+    _require(info.st_uid == os.getuid() and info.st_mode & 0o077 == 0, f"{path} is not private to this user")
+    _require(info.st_nlink == 1, f"{path} has another hard link")
 
 
 def _is_regular(path: Path) -> bool:

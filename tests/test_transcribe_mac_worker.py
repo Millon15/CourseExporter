@@ -254,16 +254,17 @@ class RemoteAudioTest(unittest.TestCase):
             self.assertTrue(process.killed)
             self.assertLessEqual(target.stat().st_size, len(AUDIO))
 
-    def test_refuses_to_write_through_a_link(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            outside = Path(tmp) / "outside"
-            outside.write_bytes(b"keep")
-            link = Path(tmp) / "item.opus.part"
-            link.symlink_to(outside)
-            remote = mac_worker.Remote(popen=lambda *a, **k: FakeProcess(AUDIO))
-            with self.assertRaises(OSError):
-                remote.audio(Lease.parse(lease_json()), link)
-            self.assertEqual(outside.read_bytes(), b"keep")
+    def test_never_writes_through_a_planted_link(self):
+        for make in (lambda link, outside: link.symlink_to(outside), lambda link, outside: os.link(outside, link)):
+            with self.subTest(make), tempfile.TemporaryDirectory() as tmp:
+                outside = Path(tmp) / "outside"
+                outside.write_bytes(b"keep")
+                part = Path(tmp) / "item.opus.part"
+                make(part, outside)
+                remote = mac_worker.Remote(popen=lambda *a, **k: FakeProcess(AUDIO))
+                remote.audio(Lease.parse(lease_json()), part)
+                self.assertEqual(outside.read_bytes(), b"keep")
+                self.assertEqual((part.read_bytes(), part.lstat().st_nlink), (AUDIO, 1))
 
 
 class IdentityTest(unittest.TestCase):
@@ -274,7 +275,7 @@ class IdentityTest(unittest.TestCase):
             config = Path(tmp) / "config"
             config.write_text(f"Host jarvis-transcribe\n  HostName 127.0.0.1\n  User openclaw\n"
                               f"  IdentityFile {tmp}/restricted\n  IdentitiesOnly yes\n  IdentityAgent none\n{extra}")
-            mac_worker.Remote("jarvis-transcribe", config).check_identity()
+            mac_worker.Remote("jarvis-transcribe", config, Path(tmp) / "restricted").check_identity()
 
     def test_accepts_exactly_the_restricted_identity(self):
         self.check()
@@ -287,6 +288,13 @@ class IdentityTest(unittest.TestCase):
                     config.write_text(f"Host jarvis-transcribe\n  HostName 127.0.0.1\n  IdentityFile {tmp}/r\n"
                                       f"  IdentitiesOnly yes\n{extra}")
                     mac_worker.Remote("jarvis-transcribe", config).check_identity()
+
+    def test_refuses_a_single_identity_that_is_not_the_restricted_key(self):
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            config = Path(tmp) / "config"
+            config.write_text(f"Host jarvis-transcribe\n  HostName 127.0.0.1\n  IdentityFile {tmp}/operator\n"
+                              "  IdentitiesOnly yes\n  IdentityAgent none\n")
+            mac_worker.Remote("jarvis-transcribe", config, Path(tmp) / "restricted").check_identity()
 
     def test_refuses_a_config_without_an_identity_file(self):
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
@@ -306,16 +314,43 @@ class ScratchTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     scratch.open()
 
-    def test_a_link_planted_after_open_is_not_followed(self):
+    def test_a_link_planted_after_open_is_replaced_never_written_through(self):
+        for make in (lambda link, outside: link.symlink_to(outside), lambda link, outside: os.link(outside, link)):
+            for name in ("item.result.json.tmp", "item.result.json"):
+                with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                    outside = Path(tmp) / "outside"
+                    outside.write_bytes(b"keep")
+                    scratch = Scratch(Path(tmp) / "scratch")
+                    scratch.open()
+                    make(scratch.root / name, outside)
+                    scratch.write(scratch.result, b"{}")
+                    self.assertEqual(outside.read_bytes(), b"keep")
+                    self.assertEqual(scratch.result.read_bytes(), b"{}")
+
+    def test_refuses_a_hard_linked_or_shared_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
             outside = Path(tmp) / "outside"
             outside.write_bytes(b"keep")
             scratch = Scratch(Path(tmp) / "scratch")
             scratch.open()
-            (scratch.root / "item.result.json.tmp").symlink_to(outside)
-            with self.assertRaises(OSError):
-                scratch.write(scratch.result, b"{}")
-            self.assertEqual(outside.read_bytes(), b"keep")
+            os.link(outside, scratch.audio)
+            with self.assertRaises(ValueError):
+                scratch.open()
+            scratch.audio.unlink()
+            scratch.write(scratch.lease, b"{}")
+            os.chmod(scratch.lease, 0o644)
+            with self.assertRaises(ValueError):
+                scratch.open()
+
+    def test_the_lock_must_be_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Scratch(Path(tmp) / "scratch")
+            scratch.open()
+            outside = Path(tmp) / "outside"
+            outside.write_bytes(b"")
+            os.link(outside, scratch.root / ".lock")
+            with self.assertRaises(ValueError), scratch.locked():
+                pass
 
     def test_clear_removes_only_its_own_names(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -80,6 +80,15 @@ class RenderTest(unittest.TestCase):
             {"start": 857.28, "end": 857.76, "speaker": "?", "text": "гнезно."},
             {"start": 857.76, "end": 859.68, "speaker": "S1", "text": "То есть, типа."}])
 
+    def test_an_empty_cue_with_a_known_other_speaker_never_joins(self):
+        with self.assertRaises(adapter.Refused):
+            adapter.render(document(cue(1.0, 1.0, "S1", "one"), cue(1.0, 2.0, "S2", "two")), VIDEO, 1, {})
+
+    def test_the_manifest_counts_cue_repairs(self):
+        doc = document(cue(1.0, 1.0, None, "То"), cue(1.0, 2.0, "S1", "есть"), cue(3.0, 3.0, "S1", "так"))
+        manifest = json.loads(rendered(doc)["manifest"].data)
+        self.assertEqual(manifest["provenance"]["cue_repairs"], {"joined": 1, "widened": 1})
+
     def test_refuses_what_uch_would_drop(self):
         long_speaker = document()
         long_speaker["segments"][0]["speaker"] = "S" * 129

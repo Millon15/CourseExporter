@@ -6,9 +6,10 @@ Contract: UCH `src/importer/transcripts.ts` (`selectTranscript`, `readCandidate`
   `.segments.json`, `.manifest.json`; the selection is `<prefix>selected.g<NNNN>.json`.
 - Times are whole milliseconds of video time, so `segments.json` and the VTT agree to the millisecond.
 - A null speaker becomes `?`. A cue that rounding leaves empty (one zero-length word) joins the next cue when that
-  starts at the same millisecond, taking its span and speaker; otherwise it widens by at most 0.2 s, never past the
-  next cue's start or the video's end. One still empty refuses the whole item. v13 decision 8 refused every empty
-  cue; this repair keeps the text (bench ru-dialogue 857.76 s: "То" + "есть, типа.").
+  starts at the same millisecond and its own speaker is unknown or the same, taking the next cue's span and speaker;
+  otherwise it widens by at most 0.2 s, never past the next cue's start or the video's end. One still empty refuses
+  the whole item. The manifest's provenance counts both repairs. v13 decision 8 refused every empty cue; this
+  repair keeps the text (bench ru-dialogue 857.76 s: unknown "То" + S1 "есть, типа.").
 - Pure: no I/O and no Drive; the publisher names, uploads and selects.
 """
 
@@ -75,7 +76,7 @@ def render(doc: dict[str, Any], video: Video, generation: int, provenance: dict[
     """The vtt, text, segments and manifest files, in the order the publisher creates them."""
     _require_video(video)
     _require_generation(generation)
-    cues = _cues(doc, video)
+    cues, repairs = _cues(doc, video)
     stem = f"{video.prefix}{pins.PRODUCER_NAME}.{pins.CONFIG8}-g{_padded(generation)}"
     outputs = [
         OutputFile.of("vtt", f"{stem}.vtt", _vtt(cues)),
@@ -83,7 +84,8 @@ def render(doc: dict[str, Any], video: Video, generation: int, provenance: dict[
         OutputFile.of("segments", f"{stem}.segments.json", _segments_json(cues)),
     ]
     _require_sizes(outputs, MAX_OUTPUT_BYTES)
-    manifest = OutputFile.of("manifest", f"{stem}.manifest.json", _manifest(doc, video, outputs, provenance))
+    manifest = OutputFile.of("manifest", f"{stem}.manifest.json",
+                             _manifest(doc, video, outputs, provenance | {"cue_repairs": repairs}))
     _require_sizes([manifest], MAX_METADATA_BYTES)
     return [*outputs, manifest]
 
@@ -111,14 +113,15 @@ def selection_pattern(video: Video) -> re.Pattern[str]:
     return re.compile(re.escape(f"{video.prefix}selected.g") + r"(\d{4,10})\.json")
 
 
-def _cues(doc: dict[str, Any], video: Video) -> list[Cue]:
+def _cues(doc: dict[str, Any], video: Video) -> tuple[list[Cue], dict[str, int]]:
     offset_ms = round(doc["source"]["offset_s"] * 1000)
     limit_ms = int(video.duration_s * 1000) + END_SLACK_MS
-    cues = _repaired([_cue(segment, offset_ms) for segment in doc["segments"]], limit_ms)
+    raw = [_cue(segment, offset_ms) for segment in doc["segments"]]
+    cues, repairs = _repaired(raw, limit_ms)
     for index, cue in enumerate(cues):
         _require(cue.end_ms > cue.start_ms, f"cue {index} at {cue.start_ms} ms is empty after millisecond rounding")
         _require(cue.end_ms <= limit_ms, f"cue {index} ends at {cue.end_ms} ms, after the video ({limit_ms} ms)")
-    return cues
+    return cues, repairs
 
 
 def _cue(segment: dict[str, Any], offset_ms: int) -> Cue:
@@ -130,20 +133,27 @@ def _cue(segment: dict[str, Any], offset_ms: int) -> Cue:
     return Cue(offset_ms + round(segment["start"] * 1000), offset_ms + round(segment["end"] * 1000), speaker, text)
 
 
-def _repaired(raw: list[Cue], limit_ms: int) -> list[Cue]:
+def _repaired(raw: list[Cue], limit_ms: int) -> tuple[list[Cue], dict[str, int]]:
     repaired: list[Cue] = []
+    repairs = {"joined": 0, "widened": 0}
     carried = ""
     for index, cue in enumerate(raw):
         cue = replace(cue, text=f"{carried} {cue.text}") if carried else cue
         following = raw[index + 1:index + 2]
         carried = cue.text if _joins_next(cue, following) else ""
-        if not carried:
-            repaired.append(_widened(cue, following, limit_ms))
-    return repaired
+        if carried:
+            repairs["joined"] += 1
+            continue
+        widened = _widened(cue, following, limit_ms)
+        repairs["widened"] += widened.end_ms != cue.end_ms
+        repaired.append(widened)
+    return repaired, repairs
 
 
 def _joins_next(cue: Cue, following: list[Cue]) -> bool:
-    return cue.end_ms <= cue.start_ms and bool(following) and following[0].start_ms == cue.start_ms
+    """An empty cue joins a next cue at the same millisecond only when that cannot reassign a known speaker."""
+    return (cue.end_ms <= cue.start_ms and bool(following) and following[0].start_ms == cue.start_ms
+            and cue.speaker in (UNKNOWN_SPEAKER, following[0].speaker))
 
 
 def _widened(cue: Cue, following: list[Cue], limit_ms: int) -> Cue:
